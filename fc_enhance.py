@@ -1054,10 +1054,13 @@ class GeminiFCEnhance:
                 "role": "model",
                 "parts": [{"text": json.dumps(args, ensure_ascii=False)}],
             })
-            feedback = "这组参数导致调用失败。"
+            feedback = "这组参数已经尝试过了，后续请不要再尝试它。"
             if res:
                 feedback += f" 返回: {res}"
-            feedback += " 请换个思路重新推断参数。"
+            feedback += (
+                " 请换个思路重新推断参数，"
+                "如减少关键词数量，更换描述，将中文关键词换为英文等。"
+            )
             extract_contents.append({
                 "role": "user",
                 "parts": [{"text": feedback}],
