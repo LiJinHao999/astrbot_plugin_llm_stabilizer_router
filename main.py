@@ -79,10 +79,20 @@ class StreamifyPlugin(Star):
             return default_timeout
         return timeout
 
+    _FC_ENHANCE_MAP = {
+        "关闭": 0,
+        "拦截空/错误调用": 1,
+        "全部拦截": 2,
+    }
+
     def _resolve_fc_enhance(self) -> int:
         # 优先读新配置
         value = self.config.get("fc_enhance")
         if value is not None:
+            # 下拉框选项（中文字符串）
+            if isinstance(value, str) and value in self._FC_ENHANCE_MAP:
+                return self._FC_ENHANCE_MAP[value]
+            # 兼容直接填数字
             try:
                 level = int(value)
             except (TypeError, ValueError):

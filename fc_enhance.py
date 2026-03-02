@@ -22,8 +22,12 @@ _DEFAULT_TOOL_ERROR_PATTERNS: List[str] = [
 def _trim_messages_by_turns(
     messages: List[Dict[str, Any]], turns: int, user_role: str = "user"
 ) -> List[Dict[str, Any]]:
-    """保留最近 N 轮对话（每轮以 user 消息为起点）。turns=0 不裁剪。"""
-    if turns <= 0 or not messages:
+    """保留最近 N 轮对话（每轮以 user 消息为起点）。turns=0 不传入对话。"""
+    if not messages:
+        return messages
+    if turns == 0:
+        return []
+    if turns < 0:
         return messages
     count = 0
     cut = 0
@@ -39,8 +43,12 @@ def _trim_messages_by_turns(
 def _trim_contents_by_turns(
     contents: List[Dict[str, Any]], turns: int, user_role: str = "user"
 ) -> List[Dict[str, Any]]:
-    """保留最近 N 轮对话（Gemini contents 格式，无 system）。turns=0 不裁剪。"""
-    if turns <= 0 or not contents:
+    """保留最近 N 轮对话（Gemini contents 格式，无 system）。turns=0 不传入对话。"""
+    if not contents:
+        return contents
+    if turns == 0:
+        return []
+    if turns < 0:
         return contents
     count = 0
     cut = 0
