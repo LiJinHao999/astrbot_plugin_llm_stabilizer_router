@@ -41,8 +41,45 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         path = sub_path.strip("/")
         return ":generateContent" in path or ":streamGenerateContent" in path
 
+    @staticmethod
+    def _payload_has_fc(payload: Dict[str, Any]) -> bool:
+        """判断 Gemini SSE 事件中是否包含 functionCall。"""
+        for candidate in (payload.get("candidates") or []):
+            for part in ((candidate.get("content") or {}).get("parts") or []):
+                if isinstance(part.get("functionCall"), dict):
+                    return True
+        return False
+
+    def _assemble_gemini_payloads(self, payloads: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """从已解析的 payload 列表组装 generateContent 格式响应。"""
+        state = self._init_state()
+        for payload in payloads:
+            self._merge_payload(state, payload)
+
+        candidate_out: Dict[str, Any] = dict(state["candidate_meta"])
+        merged_parts: List[Dict[str, Any]] = []
+        for idx in sorted(state["content_parts"].keys()):
+            part = state["content_parts"][idx]
+            if isinstance(part, dict):
+                merged_parts.append(part)
+        candidate_out["content"] = {
+            "role": state["role"],
+            "parts": merged_parts if merged_parts else [{"text": ""}],
+        }
+
+        response_data: Dict[str, Any] = {"candidates": [candidate_out]}
+        if state["usage_metadata"] is not None:
+            response_data["usageMetadata"] = state["usage_metadata"]
+        if state["prompt_feedback"] is not None:
+            response_data["promptFeedback"] = state["prompt_feedback"]
+        if state["model_version"] is not None:
+            response_data["modelVersion"] = state["model_version"]
+        return response_data
+
+    # ------------------------------------------------------------------
+    # Layer 2 用：将完整结果以单条 Gemini SSE 事件返回
+    # ------------------------------------------------------------------
     async def _emit_as_sse(self, result: Dict[str, Any], req: web.Request) -> web.StreamResponse:
-        """将聚合后的 generateContent 结果重新以 SSE 流格式返回给客户端。"""
         response = web.StreamResponse(headers={
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
@@ -52,6 +89,145 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         await response.write_eof()
         return response
 
+    # ------------------------------------------------------------------
+    # 流式请求主入口：无 functionCall 的事件直通，有 functionCall 的拦截修复后发出
+    # ------------------------------------------------------------------
+    async def _handle_stream_fc_hook(
+        self,
+        req: web.Request,
+        stream_path: str,
+        clean_body: Dict[str, Any],
+        headers: Dict[str, str],
+        params: Dict[str, str],
+    ) -> web.Response:
+        async with self._request(
+            "POST", self._build_url(stream_path),
+            json=clean_body, headers=headers, params=params,
+        ) as resp:
+            if resp.status != 200:
+                return web.Response(
+                    status=resp.status,
+                    headers=self._response_headers(resp),
+                    text=await resp.text(),
+                )
+
+            client = web.StreamResponse(headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+            })
+            await client.prepare(req)
+
+            fc_buffer: List[Dict[str, Any]] = []  # 含 functionCall 的 payloads
+            fc_detected = False
+
+            async for _, data in self._iter_sse_events(resp):
+                try:
+                    payload = json.loads(data)
+                except json.JSONDecodeError:
+                    if not fc_detected:
+                        await client.write(f"data: {data}\n\n".encode())
+                    continue
+                if not isinstance(payload, dict):
+                    continue
+
+                if not fc_detected and self._payload_has_fc(payload):
+                    fc_detected = True
+
+                if fc_detected:
+                    fc_buffer.append(payload)
+                else:
+                    await client.write(f"data: {json.dumps(payload)}\n\n".encode())
+
+        if not fc_detected:
+            await client.write_eof()
+            return client
+
+        # 组装 FC 结果用于检测
+        response_data = self._assemble_gemini_payloads(fc_buffer)
+        tools = clean_body.get("tools", [])
+
+        has_failed = self._has_failed_function_call(response_data, tools)
+        if not has_failed and self._hint_tools:
+            has_failed = self._find_hinted_empty_fc(response_data) is not None
+
+        if not has_failed:
+            # 无需修复：重放原始 FC 事件
+            for payload in fc_buffer:
+                await client.write(f"data: {json.dumps(payload)}\n\n".encode())
+            await client.write_eof()
+            return client
+
+        # 需要修复：Layer 1 + 重试
+        if self.extract_args:
+            failed_fc = self._find_failed_function_call(response_data, tools)
+            if failed_fc is None and self._hint_tools:
+                failed_fc = self._find_hinted_empty_fc(response_data)
+            if failed_fc is not None:
+                extracted = await self._extract_args_as_json(
+                    clean_body, failed_fc.get("name", ""), stream_path, headers, params
+                )
+                if extracted is not None:
+                    self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
+                    if self.debug:
+                        logger.info("Streamify [Layer1]: 成功提取 Gemini 工具 %s 参数(流式)", failed_fc.get("name"))
+                    await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+                    await client.write_eof()
+                    return client
+                elif self.debug:
+                    logger.info("Streamify [Layer1]: Gemini JSON 提取失败，重试(流式)")
+
+        retry_fc = self._find_failed_function_call(response_data, tools)
+        if retry_fc is None and self._hint_tools:
+            retry_fc = self._find_hinted_empty_fc(response_data)
+        retry_name = retry_fc.get("name", "") if retry_fc else ""
+
+        for attempt in range(self.fix_retries):
+            if self.debug:
+                logger.info("Streamify: 流式 Gemini FC 修复重试 (%d/%d)", attempt + 1, self.fix_retries)
+            current_body = self._inject_hint(clean_body, retry_name)
+            async with self._request(
+                "POST", self._build_url(stream_path),
+                json=current_body, headers=headers, params=params,
+            ) as retry_resp:
+                if retry_resp.status != 200:
+                    break
+                response_data = await self._build_non_stream_response(retry_resp)
+
+            has_failed = self._has_failed_function_call(response_data, tools)
+            if not has_failed and self._hint_tools:
+                has_failed = self._find_hinted_empty_fc(response_data) is not None
+            if not has_failed:
+                await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+                await client.write_eof()
+                return client
+
+            if self.extract_args:
+                retry_failed_fc = self._find_failed_function_call(response_data, tools)
+                if retry_failed_fc is None and self._hint_tools:
+                    retry_failed_fc = self._find_hinted_empty_fc(response_data)
+                if retry_failed_fc is not None:
+                    extracted = await self._extract_args_as_json(
+                        clean_body, retry_failed_fc.get("name", ""), stream_path, headers, params
+                    )
+                    if extracted is not None:
+                        self._patch_function_call_args(response_data, retry_failed_fc.get("name", ""), extracted)
+                        await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+                        await client.write_eof()
+                        return client
+
+        failed_fc = self._find_failed_function_call(response_data, tools)
+        if failed_fc is None and self._hint_tools:
+            failed_fc = self._find_hinted_empty_fc(response_data)
+        function_name = failed_fc.get("name", "unknown") if failed_fc else "unknown"
+        logger.warning("Streamify: 工具 %s 参数在 %d 次重试后仍为空(流式)", function_name, self.fix_retries)
+        _inject_fc_failure_text_gemini(response_data, function_name)
+        await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+        await client.write_eof()
+        return client
+
+    # ------------------------------------------------------------------
+    # 主 handle
+    # ------------------------------------------------------------------
     async def handle(self, req: web.Request, sub_path: str) -> web.Response:
         if req.method.upper() != "POST" or not self.matches(sub_path):
             return await self._passthrough(req, sub_path)
@@ -59,7 +235,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         path = sub_path.strip("/")
         client_wants_stream = ":streamGenerateContent" in path
 
-        # 推导上游 streamGenerateContent 路径
         if client_wants_stream:
             stream_path = path
         else:
@@ -69,7 +244,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         if body is None:
             return await self._passthrough(req, sub_path)
 
-        # 临时调试：打印 contents 中的图片 part 结构（不打印实际数据）
         if body and self.debug:
             for i, c in enumerate(body.get("contents", [])):
                 for j, p in enumerate(c.get("parts", [])):
@@ -91,7 +265,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
 
         clean_body = body
 
-        # Layer 2 (Reactive): 检测传入请求中是否已有工具执行错误
+        # Layer 2 (Reactive)
         if self.extract_args:
             error_info = self._find_tool_error_in_request(body)
             if error_info is not None:
@@ -108,8 +282,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                             tool_name, extracted,
                         )
                     self._remember_hint_tool(tool_name)
-                    # 不返回合成响应（缺 thoughtSignature 会导致后续请求 400），
-                    # 而是把提取到的参数注入上下文，让模型自己生成带签名的 function call
                     args_hint = (
                         f"重要：你必须使用以下参数调用工具 `{tool_name}`：\n"
                         f"{json.dumps(extracted, ensure_ascii=False)}"
@@ -128,18 +300,21 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                             "Streamify [Layer2]: Gemini 工具 %s 参数提取失败，继续正常转发",
                             tool_name,
                         )
-                    # 提取失败时仅清理 contents（不覆盖已注入 args_hint 的 clean_body）
                     clean_body = {**body, "contents": ctx_contents}
 
         tools = clean_body.get("tools", [])
 
-        # 假非流禁用时直通
-        if not self.pseudo_non_stream:
+        if not self.pseudo_non_stream and not client_wants_stream:
             if clean_body is not body:
                 return await self._passthrough(req, sub_path,
                                                _body=json.dumps(clean_body).encode())
             return await self._passthrough(req, sub_path)
 
+        # 流式请求：有条件透传 + FC 拦截检测修复
+        if client_wants_stream:
+            return await self._handle_stream_fc_hook(req, stream_path, clean_body, headers, params)
+
+        # 非流式请求：内部转流收集，FC 检测修复后返回 JSON
         async with self._request(
             "POST",
             self._build_url(stream_path),
@@ -159,11 +334,8 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         if not has_failed and self._hint_tools:
             has_failed = self._find_hinted_empty_fc(response_data) is not None
         if not has_failed:
-            if client_wants_stream:
-                return await self._emit_as_sse(response_data, req)
             return web.json_response(response_data)
 
-        # Layer 1 (Proactive): 对照 schema 提取参数
         if self.extract_args:
             failed_fc = self._find_failed_function_call(response_data, tools)
             if failed_fc is None and self._hint_tools:
@@ -173,16 +345,12 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     clean_body, failed_fc.get("name", ""), stream_path, headers, params
                 )
                 if extracted is not None:
-                    self._patch_function_call_args(
-                        response_data, failed_fc.get("name", ""), extracted
-                    )
+                    self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
                     if self.debug:
                         logger.info(
                             "Streamify [Layer1]: 成功提取 Gemini 工具 %s 的参数: %s",
                             failed_fc.get("name"), extracted,
                         )
-                    if client_wants_stream:
-                        return await self._emit_as_sse(response_data, req)
                     return web.json_response(response_data)
                 elif self.debug:
                     logger.info("Streamify [Layer1]: Gemini JSON 参数提取失败，尝试提示注入重试")
@@ -232,8 +400,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             if not has_failed and self._hint_tools:
                 has_failed = self._find_hinted_empty_fc(response_data) is not None
             if not has_failed:
-                if client_wants_stream:
-                    return await self._emit_as_sse(response_data, req)
                 return web.json_response(response_data)
             if self.extract_args:
                 retry_failed_fc = self._find_failed_function_call(response_data, tools)
@@ -252,8 +418,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                                 "Streamify [Layer1]: 成功提取 Gemini 工具 %s 的参数: %s",
                                 retry_failed_fc.get("name"), extracted,
                             )
-                        if client_wants_stream:
-                            return await self._emit_as_sse(response_data, req)
                         return web.json_response(response_data)
 
         failed_fc = self._find_failed_function_call(response_data, tools)
@@ -265,6 +429,4 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             function_name, self.fix_retries,
         )
         _inject_fc_failure_text_gemini(response_data, function_name)
-        if client_wants_stream:
-            return await self._emit_as_sse(response_data, req)
         return web.json_response(response_data)
