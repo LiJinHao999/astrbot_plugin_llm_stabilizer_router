@@ -167,6 +167,17 @@ class OpenAIFCEnhance:
                     return tc
         return None
 
+    @staticmethod
+    def _find_first_function_call(
+        response_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """返回响应中第一个 tool_call（无论参数是否为空）。"""
+        for choice in response_data.get("choices", []):
+            for tc in ((choice.get("message") or {}).get("tool_calls") or []):
+                if isinstance(tc, dict):
+                    return tc
+        return None
+
     def _find_tool_error_in_request(
         self,
         body: Dict[str, Any],
@@ -439,6 +450,16 @@ class ClaudeFCEnhance:
                 tool_name = block.get("name", "")
                 if ClaudeFCEnhance._tool_has_required_params(tools, tool_name):
                     return block
+        return None
+
+    @staticmethod
+    def _find_first_function_call(
+        response_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """返回响应中第一个 tool_use block（无论参数是否为空）。"""
+        for block in response_data.get("content", []):
+            if isinstance(block, dict) and block.get("type") == "tool_use":
+                return block
         return None
 
     def _find_tool_error_in_request(
@@ -740,6 +761,18 @@ class GeminiFCEnhance:
                         return fc
         return None
 
+    @staticmethod
+    def _find_first_function_call(
+        response_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """返回响应中第一个 functionCall（无论参数是否为空）。"""
+        for candidate in response_data.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                fc = part.get("functionCall")
+                if isinstance(fc, dict):
+                    return fc
+        return None
+
     def _find_tool_error_in_request(
         self,
         body: Dict[str, Any],
@@ -796,7 +829,7 @@ class GeminiFCEnhance:
         for candidate in response_data.get("candidates", []):
             for part in candidate.get("content", {}).get("parts", []):
                 fc = part.get("functionCall")
-                if isinstance(fc, dict) and fc.get("name") == function_name and not fc.get("args"):
+                if isinstance(fc, dict) and fc.get("name") == function_name:
                     fc["args"] = args
                     return
 
@@ -1008,6 +1041,16 @@ class OpenAIResponsesFCEnhance:
             try:
                 json.loads(args)
             except json.JSONDecodeError:
+                return item
+        return None
+
+    @staticmethod
+    def _find_first_function_call(
+        response_data: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """返回响应中第一个 function_call 项（无论参数是否为空）。"""
+        for item in response_data.get("output", []):
+            if isinstance(item, dict) and item.get("type") == "function_call":
                 return item
         return None
 

@@ -79,6 +79,21 @@ class StreamifyPlugin(Star):
             return default_timeout
         return timeout
 
+    def _resolve_fc_enhance(self) -> int:
+        # 优先读新配置
+        value = self.config.get("fc_enhance")
+        if value is not None:
+            try:
+                level = int(value)
+            except (TypeError, ValueError):
+                level = 1
+            return max(0, min(2, level))  # clamp 到 0-2
+        # 向后兼容：extract_args / gemini_extract_args (bool → int)
+        old = self.config.get("extract_args", self.config.get("gemini_extract_args"))
+        if old is not None:
+            return 1 if self._parse_bool(old, False) else 0
+        return 1  # 默认值
+
     def _resolve_fc_context_turns(self) -> int:
         default = 1
         value = self.config.get("fc_context_turns", default)
@@ -157,13 +172,10 @@ class StreamifyPlugin(Star):
             True,
         )
         fix_retries = self._resolve_fix_retries()
-        extract_args = self._parse_bool(
-            self.config.get("extract_args", self.config.get("gemini_extract_args", False)),
-            False,
-        )
+        fc_enhance = self._resolve_fc_enhance()
         fc_context_turns = self._resolve_fc_context_turns()
 
-        if not pseudo_non_stream and not extract_args:
+        if not pseudo_non_stream and fc_enhance == 0:
             logger.info("Streamify: 假非流与 FC 增强均已禁用，代理不启动")
             return
 
@@ -182,7 +194,7 @@ class StreamifyPlugin(Star):
             debug=debug,
             request_timeout=request_timeout,
             pseudo_non_stream=pseudo_non_stream,
-            extract_args=extract_args,
+            fc_enhance=fc_enhance,
             fix_retries=fix_retries,
             tool_error_patterns=tool_error_patterns,
             fc_context_turns=fc_context_turns,

@@ -92,7 +92,7 @@ class ProviderHandler:
         debug: bool = False,
         request_timeout: float = 120.0,
         pseudo_non_stream: bool = True,
-        extract_args: bool = False,
+        fc_enhance: int = 1,
         fix_retries: int = 1,
         tool_error_patterns: Optional[List[str]] = None,
         fc_context_turns: int = 1,
@@ -103,7 +103,7 @@ class ProviderHandler:
         self.debug = bool(debug)
         self.request_timeout = self._normalize_timeout(request_timeout)
         self.pseudo_non_stream = bool(pseudo_non_stream)
-        self.extract_args = bool(extract_args)
+        self.fc_enhance = max(0, min(2, int(fc_enhance)))
         self.fix_retries = max(0, int(fix_retries))
         self.fc_context_turns = max(0, int(fc_context_turns))
         patterns = tool_error_patterns if tool_error_patterns is not None else _DEFAULT_TOOL_ERROR_PATTERNS

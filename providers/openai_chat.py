@@ -220,11 +220,15 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
         assembled = self._assemble_tc_chunks(tc_buffer, base_meta)
         tools = clean_body.get("tools") or []
 
-        failed = self._find_failed_function_call(assembled, tools)
-        if failed is None and self._hint_tools:
-            failed = self._find_hinted_empty_tc(assembled)
+        target_tc = self._find_failed_function_call(assembled, tools)
+        if target_tc is None and self._hint_tools:
+            target_tc = self._find_hinted_empty_tc(assembled)
+        is_failed = target_tc is not None
 
-        if failed is None:
+        if self.fc_enhance >= 2 and target_tc is None:
+            target_tc = self._find_first_function_call(assembled)
+
+        if target_tc is None:
             # 无需修复：重放原始 TC chunks
             for c in tc_buffer:
                 await client.write(f"data: {json.dumps(c)}\n\n".encode())
@@ -232,74 +236,80 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
             await client.write_eof()
             return client
 
-        # 需要修复：Layer 1 + 重试
+        # 需要修复
         result = assembled
         model_reply = forwarded_text
 
-        if self.extract_args:
-            fn_name = (failed.get("function") or {}).get("name", "")
-            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
-                                                         model_reply=model_reply)
-            if extracted is not None:
-                _before = (failed.get("function") or {}).get("arguments", "{}")
-                self._patch_function_call_args(result, fn_name, extracted)
-                self._log_fc_modify("openai", 1, fn_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
-                    context=clean_body.get("messages", []))
-                if self.debug:
-                    logger.info("Streamify [Layer1]: 成功提取 OpenAI 工具 %s 参数(流式)", fn_name)
-                await self._write_tc_sse(client, result, base_meta)
-                await client.write(b"data: [DONE]\n\n")
-                await client.write_eof()
-                return client
-            elif self.debug:
-                logger.info("Streamify [Layer1]: OpenAI JSON 提取失败，重试(流式)")
-
-        retry_name = (failed.get("function") or {}).get("name", "") if failed else ""
-        for attempt in range(self.fix_retries):
+        fn_name = (target_tc.get("function") or {}).get("name", "")
+        extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                     model_reply=model_reply)
+        if extracted is not None:
+            _before = (target_tc.get("function") or {}).get("arguments", "{}")
+            self._patch_function_call_args(result, fn_name, extracted)
+            self._log_fc_modify("openai", 1, fn_name, _before, extracted,
+                hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
+                context=clean_body.get("messages", []))
             if self.debug:
-                logger.info("Streamify: 流式 TC 修复重试 (%d/%d)", attempt + 1, self.fix_retries)
-            current_body = self._inject_hint(clean_body, retry_name)
-            current_body["stream"] = True
-            async with self._request(
-                "POST", self._build_url(sub_path),
-                json=current_body, headers=headers, params=req.query,
-            ) as retry_resp:
-                if retry_resp.status != 200:
-                    break
-                result = await self._build_non_stream_response(retry_resp)
+                logger.info("Streamify [Layer1]: 成功提取 OpenAI 工具 %s 参数(流式)", fn_name)
+            await self._write_tc_sse(client, result, base_meta)
+            await client.write(b"data: [DONE]\n\n")
+            await client.write_eof()
+            return client
+        elif self.debug:
+            logger.info("Streamify [Layer1]: OpenAI JSON 提取失败，重试(流式)")
 
-            failed = self._find_failed_function_call(result, tools)
-            if failed is None and self._hint_tools:
-                failed = self._find_hinted_empty_tc(result)
-            if failed is None:
-                await self._write_tc_sse(client, result, base_meta)
-                await client.write(b"data: [DONE]\n\n")
-                await client.write_eof()
-                return client
+        if is_failed:
+            retry_name = fn_name
+            for attempt in range(self.fix_retries):
+                if self.debug:
+                    logger.info("Streamify: 流式 TC 修复重试 (%d/%d)", attempt + 1, self.fix_retries)
+                current_body = self._inject_hint(clean_body, retry_name)
+                current_body["stream"] = True
+                async with self._request(
+                    "POST", self._build_url(sub_path),
+                    json=current_body, headers=headers, params=req.query,
+                ) as retry_resp:
+                    if retry_resp.status != 200:
+                        break
+                    result = await self._build_non_stream_response(retry_resp)
 
-            if self.extract_args:
-                fn_name = (failed.get("function") or {}).get("name", "")
-                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                failed_tc = self._find_failed_function_call(result, tools)
+                if failed_tc is None and self._hint_tools:
+                    failed_tc = self._find_hinted_empty_tc(result)
+                if failed_tc is None:
+                    await self._write_tc_sse(client, result, base_meta)
+                    await client.write(b"data: [DONE]\n\n")
+                    await client.write_eof()
+                    return client
+
+                fn2 = (failed_tc.get("function") or {}).get("name", "")
+                extracted = await self._extract_args_as_json(clean_body, fn2, sub_path, headers,
                                                              model_reply=model_reply)
                 if extracted is not None:
-                    _before = (failed.get("function") or {}).get("arguments", "{}")
-                    self._patch_function_call_args(result, fn_name, extracted)
-                    self._log_fc_modify("openai", 1, fn_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
+                    _before = (failed_tc.get("function") or {}).get("arguments", "{}")
+                    self._patch_function_call_args(result, fn2, extracted)
+                    self._log_fc_modify("openai", 1, fn2, _before, extracted,
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn2, model_reply=model_reply),
                         context=clean_body.get("messages", []))
                     await self._write_tc_sse(client, result, base_meta)
                     await client.write(b"data: [DONE]\n\n")
                     await client.write_eof()
                     return client
 
-        # 全部重试失败，注入失败提示
-        fail_name = (failed.get("function") or {}).get("name", "unknown") if failed else "unknown"
-        _inject_fc_failure_text_openai(result, fail_name)
-        await self._write_tc_sse(client, result, base_meta)
-        await client.write(b"data: [DONE]\n\n")
-        await client.write_eof()
-        return client
+            # 全部重试失败，注入失败提示
+            fail_name = (failed_tc.get("function") or {}).get("name", "unknown") if failed_tc else "unknown"
+            _inject_fc_failure_text_openai(result, fail_name)
+            await self._write_tc_sse(client, result, base_meta)
+            await client.write(b"data: [DONE]\n\n")
+            await client.write_eof()
+            return client
+        else:
+            # Level 2 提取失败但原参数非空，重放原始 TC chunks
+            for c in tc_buffer:
+                await client.write(f"data: {json.dumps(c)}\n\n".encode())
+            await client.write(b"data: [DONE]\n\n")
+            await client.write_eof()
+            return client
 
     # ------------------------------------------------------------------
     # 主 handle
@@ -317,7 +327,7 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
         clean_body = body
 
         # Layer 2 (Reactive): 检测传入请求中是否已有工具执行错误
-        if self.extract_args:
+        if self.fc_enhance >= 1:
             error_info = self._find_tool_error_in_request(body)
             if error_info is not None:
                 tool_name, tool_call_id, assistant_msg_idx = error_info
@@ -358,8 +368,7 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
 
         # 流式客户端：有条件透传 + TC 拦截检测修复
         if client_wants_stream:
-            # 无 tools 定义时直接透传，不走 FC hook
-            if not clean_body.get("tools") and not clean_body.get("functions"):
+            if (not clean_body.get("tools") and not clean_body.get("functions")) or self.fc_enhance == 0:
                 return await self._proxy_stream(req, sub_path, clean_body, headers)
             return await self._handle_stream_fc_hook(req, sub_path, clean_body, headers)
 
@@ -380,84 +389,90 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
                 )
             result = await self._build_non_stream_response(resp)
 
-        failed_tc = self._find_failed_function_call(result, clean_body.get("tools", []))
-        if failed_tc is None and self._hint_tools:
-            failed_tc = self._find_hinted_empty_tc(result)
-        if failed_tc is None:
+        if self.fc_enhance == 0:
             return web.json_response(result)
 
-        if self.extract_args:
-            function_name = (failed_tc.get("function") or {}).get("name", "")
-            # 提取模型回复文本
-            model_reply = (result.get("choices", [{}])[0].get("message") or {}).get("content", "") or ""
-            extracted = await self._extract_args_as_json(
-                clean_body, function_name, sub_path, headers,
-                model_reply=model_reply,
-            )
-            if extracted is not None:
-                _before = (failed_tc.get("function") or {}).get("arguments", "{}")
-                self._patch_function_call_args(result, function_name, extracted)
-                self._log_fc_modify("openai", 1, function_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=model_reply),
-                    context=clean_body.get("messages", []))
-                if self.debug:
-                    logger.info(
-                        "Streamify [Layer1]: 成功提取 OpenAI 工具 %s 的参数: %s",
-                        function_name, extracted,
-                    )
-                return web.json_response(result)
-            elif self.debug:
-                logger.info("Streamify [Layer1]: OpenAI JSON 参数提取失败，尝试提示注入重试")
+        target_tc = self._find_failed_function_call(result, clean_body.get("tools", []))
+        if target_tc is None and self._hint_tools:
+            target_tc = self._find_hinted_empty_tc(result)
+        is_failed = target_tc is not None
 
-        retry_tool_name = (failed_tc.get("function") or {}).get("name", "") if failed_tc else ""
-        for attempt in range(self.fix_retries):
+        if self.fc_enhance >= 2 and target_tc is None:
+            target_tc = self._find_first_function_call(result)
+
+        if target_tc is None:
+            return web.json_response(result)
+
+        function_name = (target_tc.get("function") or {}).get("name", "")
+        # 提取模型回复文本
+        model_reply = (result.get("choices", [{}])[0].get("message") or {}).get("content", "") or ""
+        extracted = await self._extract_args_as_json(
+            clean_body, function_name, sub_path, headers,
+            model_reply=model_reply,
+        )
+        if extracted is not None:
+            _before = (target_tc.get("function") or {}).get("arguments", "{}")
+            self._patch_function_call_args(result, function_name, extracted)
+            self._log_fc_modify("openai", 1, function_name, _before, extracted,
+                hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=model_reply),
+                context=clean_body.get("messages", []))
             if self.debug:
                 logger.info(
-                    "Streamify: 检测到空工具参数，注入提示后重试 (%d/%d)",
-                    attempt + 1, self.fix_retries,
+                    "Streamify [Layer1]: 成功提取 OpenAI 工具 %s 的参数: %s",
+                    function_name, extracted,
                 )
-            current_body = self._inject_hint(clean_body, retry_tool_name)
-            current_body["stream"] = True
-            async with self._request(
-                "POST",
-                self._build_url(sub_path),
-                json=current_body,
-                headers=headers,
-                params=req.query,
-            ) as resp:
-                if resp.status != 200:
-                    return web.Response(
-                        status=resp.status,
-                        headers=self._response_headers(resp),
-                        text=await resp.text(),
+            return web.json_response(result)
+        elif self.debug:
+            logger.info("Streamify [Layer1]: OpenAI JSON 参数提取失败，尝试提示注入重试")
+
+        if is_failed:
+            for attempt in range(self.fix_retries):
+                if self.debug:
+                    logger.info(
+                        "Streamify: 检测到空工具参数，注入提示后重试 (%d/%d)",
+                        attempt + 1, self.fix_retries,
                     )
-                result = await self._build_non_stream_response(resp)
-            failed_tc = self._find_failed_function_call(result, clean_body.get("tools", []))
-            if failed_tc is None and self._hint_tools:
-                failed_tc = self._find_hinted_empty_tc(result)
-            if failed_tc is None:
-                return web.json_response(result)
-            if self.extract_args:
-                function_name = (failed_tc.get("function") or {}).get("name", "")
-                # 提取重试响应中的模型回复文本
+                current_body = self._inject_hint(clean_body, function_name)
+                current_body["stream"] = True
+                async with self._request(
+                    "POST",
+                    self._build_url(sub_path),
+                    json=current_body,
+                    headers=headers,
+                    params=req.query,
+                ) as resp:
+                    if resp.status != 200:
+                        return web.Response(
+                            status=resp.status,
+                            headers=self._response_headers(resp),
+                            text=await resp.text(),
+                        )
+                    result = await self._build_non_stream_response(resp)
+                failed_tc = self._find_failed_function_call(result, clean_body.get("tools", []))
+                if failed_tc is None and self._hint_tools:
+                    failed_tc = self._find_hinted_empty_tc(result)
+                if failed_tc is None:
+                    return web.json_response(result)
+                fn2 = (failed_tc.get("function") or {}).get("name", "")
                 _retry_reply = (result.get("choices", [{}])[0].get("message") or {}).get("content", "") or ""
                 extracted = await self._extract_args_as_json(
-                    clean_body, function_name, sub_path, headers,
+                    clean_body, fn2, sub_path, headers,
                     model_reply=_retry_reply,
                 )
                 if extracted is not None:
                     _before = (failed_tc.get("function") or {}).get("arguments", "{}")
-                    self._patch_function_call_args(result, function_name, extracted)
-                    self._log_fc_modify("openai", 1, function_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=_retry_reply),
+                    self._patch_function_call_args(result, fn2, extracted)
+                    self._log_fc_modify("openai", 1, fn2, _before, extracted,
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn2, model_reply=_retry_reply),
                         context=clean_body.get("messages", []))
                     if self.debug:
                         logger.info(
                             "Streamify [Layer1]: 成功提取 OpenAI 工具 %s 的参数: %s",
-                            function_name, extracted,
+                            fn2, extracted,
                         )
                     return web.json_response(result)
 
-        _fail_name = (failed_tc.get("function") or {}).get("name", "unknown") if failed_tc else "unknown"
-        _inject_fc_failure_text_openai(result, _fail_name)
+            _fail_name = (failed_tc.get("function") or {}).get("name", "unknown") if failed_tc else "unknown"
+            _inject_fc_failure_text_openai(result, _fail_name)
+
         return web.json_response(result)

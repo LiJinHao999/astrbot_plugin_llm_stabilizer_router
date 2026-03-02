@@ -150,18 +150,22 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         response_data = self._assemble_gemini_payloads(fc_buffer)
         tools = clean_body.get("tools", [])
 
-        has_failed = self._has_failed_function_call(response_data, tools)
-        if not has_failed and self._hint_tools:
-            has_failed = self._find_hinted_empty_fc(response_data) is not None
+        target_fc = self._find_failed_function_call(response_data, tools)
+        if target_fc is None and self._hint_tools:
+            target_fc = self._find_hinted_empty_fc(response_data)
+        is_failed = target_fc is not None
 
-        if not has_failed:
+        if self.fc_enhance >= 2 and target_fc is None:
+            target_fc = self._find_first_function_call(response_data)
+
+        if target_fc is None:
             # 无需修复：重放原始 FC 事件
             for payload in fc_buffer:
                 await client.write(f"data: {json.dumps(payload)}\n\n".encode())
             await client.write_eof()
             return client
 
-        # 需要修复：Layer 1 + 重试
+        # 需要修复
         # 提取模型回复文本（已转发文本 + FC 响应中的文本 parts）
         _reply_parts = []
         for candidate in response_data.get("candidates", []):
@@ -170,55 +174,47 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     _reply_parts.append(part["text"])
         model_reply = forwarded_text + "".join(_reply_parts)
 
-        if self.extract_args:
-            failed_fc = self._find_failed_function_call(response_data, tools)
-            if failed_fc is None and self._hint_tools:
-                failed_fc = self._find_hinted_empty_fc(response_data)
-            if failed_fc is not None:
-                extracted = await self._extract_args_as_json(
-                    clean_body, failed_fc.get("name", ""), stream_path, headers, params,
-                    model_reply=model_reply,
-                )
-                if extracted is not None:
-                    _before = failed_fc.get("args", {})
-                    self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
-                    self._log_fc_modify("gemini", 1, failed_fc.get("name", ""), _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", ""), model_reply=model_reply),
-                        context=clean_body.get("contents", []))
-                    if self.debug:
-                        logger.info("Streamify [Layer1]: 成功提取 Gemini 工具 %s 参数(流式)", failed_fc.get("name"))
+        fn_name = target_fc.get("name", "")
+        extracted = await self._extract_args_as_json(
+            clean_body, fn_name, stream_path, headers, params,
+            model_reply=model_reply,
+        )
+        if extracted is not None:
+            _before = target_fc.get("args", {})
+            self._patch_function_call_args(response_data, fn_name, extracted)
+            self._log_fc_modify("gemini", 1, fn_name, _before, extracted,
+                hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
+                context=clean_body.get("contents", []))
+            if self.debug:
+                logger.info("Streamify [Layer1]: 成功提取 Gemini 工具 %s 参数(流式)", fn_name)
+            await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+            await client.write_eof()
+            return client
+        elif self.debug:
+            logger.info("Streamify [Layer1]: Gemini JSON 提取失败，重试(流式)")
+
+        if is_failed:
+            retry_name = fn_name
+            for attempt in range(self.fix_retries):
+                if self.debug:
+                    logger.info("Streamify: 流式 Gemini FC 修复重试 (%d/%d)", attempt + 1, self.fix_retries)
+                current_body = self._inject_hint(clean_body, retry_name)
+                async with self._request(
+                    "POST", self._build_url(stream_path),
+                    json=current_body, headers=headers, params=params,
+                ) as retry_resp:
+                    if retry_resp.status != 200:
+                        break
+                    response_data = await self._build_non_stream_response(retry_resp)
+
+                has_failed_retry = self._has_failed_function_call(response_data, tools)
+                if not has_failed_retry and self._hint_tools:
+                    has_failed_retry = self._find_hinted_empty_fc(response_data) is not None
+                if not has_failed_retry:
                     await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
                     await client.write_eof()
                     return client
-                elif self.debug:
-                    logger.info("Streamify [Layer1]: Gemini JSON 提取失败，重试(流式)")
 
-        retry_fc = self._find_failed_function_call(response_data, tools)
-        if retry_fc is None and self._hint_tools:
-            retry_fc = self._find_hinted_empty_fc(response_data)
-        retry_name = retry_fc.get("name", "") if retry_fc else ""
-
-        for attempt in range(self.fix_retries):
-            if self.debug:
-                logger.info("Streamify: 流式 Gemini FC 修复重试 (%d/%d)", attempt + 1, self.fix_retries)
-            current_body = self._inject_hint(clean_body, retry_name)
-            async with self._request(
-                "POST", self._build_url(stream_path),
-                json=current_body, headers=headers, params=params,
-            ) as retry_resp:
-                if retry_resp.status != 200:
-                    break
-                response_data = await self._build_non_stream_response(retry_resp)
-
-            has_failed = self._has_failed_function_call(response_data, tools)
-            if not has_failed and self._hint_tools:
-                has_failed = self._find_hinted_empty_fc(response_data) is not None
-            if not has_failed:
-                await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
-                await client.write_eof()
-                return client
-
-            if self.extract_args:
                 retry_failed_fc = self._find_failed_function_call(response_data, tools)
                 if retry_failed_fc is None and self._hint_tools:
                     retry_failed_fc = self._find_hinted_empty_fc(response_data)
@@ -237,15 +233,21 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                         await client.write_eof()
                         return client
 
-        failed_fc = self._find_failed_function_call(response_data, tools)
-        if failed_fc is None and self._hint_tools:
-            failed_fc = self._find_hinted_empty_fc(response_data)
-        function_name = failed_fc.get("name", "unknown") if failed_fc else "unknown"
-        logger.warning("Streamify: 工具 %s 参数在 %d 次重试后仍为空(流式)", function_name, self.fix_retries)
-        _inject_fc_failure_text_gemini(response_data, function_name)
-        await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
-        await client.write_eof()
-        return client
+            failed_fc = self._find_failed_function_call(response_data, tools)
+            if failed_fc is None and self._hint_tools:
+                failed_fc = self._find_hinted_empty_fc(response_data)
+            fail_name = failed_fc.get("name", "unknown") if failed_fc else "unknown"
+            logger.warning("Streamify: 工具 %s 参数在 %d 次重试后仍为空(流式)", fail_name, self.fix_retries)
+            _inject_fc_failure_text_gemini(response_data, fail_name)
+            await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+            await client.write_eof()
+            return client
+        else:
+            # Level 2 提取失败但原参数非空，重放原始 FC 事件
+            for payload in fc_buffer:
+                await client.write(f"data: {json.dumps(payload)}\n\n".encode())
+            await client.write_eof()
+            return client
 
     # ------------------------------------------------------------------
     # 主 handle
@@ -288,7 +290,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
         clean_body = body
 
         # Layer 2 (Reactive)
-        if self.extract_args:
+        if self.fc_enhance >= 1:
             error_info = self._find_tool_error_in_request(body)
             if error_info is not None:
                 tool_name, error_idx = error_info
@@ -337,8 +339,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
 
         # 流式请求：有条件透传 + FC 拦截检测修复
         if client_wants_stream:
-            # 无 tools 定义时直接透传
-            if not clean_body.get("tools"):
+            if not clean_body.get("tools") or self.fc_enhance == 0:
                 return await self._proxy_stream(req, stream_path, clean_body, headers, params)
             return await self._handle_stream_fc_hook(req, stream_path, clean_body, headers, params)
 
@@ -358,95 +359,95 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                 )
             response_data = await self._build_non_stream_response(resp)
 
-        has_failed = self._has_failed_function_call(response_data, tools)
-        if not has_failed and self._hint_tools:
-            has_failed = self._find_hinted_empty_fc(response_data) is not None
-        if not has_failed:
+        if self.fc_enhance == 0:
             return web.json_response(response_data)
 
-        if self.extract_args:
-            failed_fc = self._find_failed_function_call(response_data, tools)
-            if failed_fc is None and self._hint_tools:
-                failed_fc = self._find_hinted_empty_fc(response_data)
-            if failed_fc is not None:
-                # 提取模型回复文本
-                _reply_parts = []
-                for candidate in response_data.get("candidates", []):
-                    for part in (candidate.get("content") or {}).get("parts", []):
-                        if isinstance(part.get("text"), str):
-                            _reply_parts.append(part["text"])
-                model_reply = "".join(_reply_parts)
-                extracted = await self._extract_args_as_json(
-                    clean_body, failed_fc.get("name", ""), stream_path, headers, params,
-                    model_reply=model_reply,
-                )
-                if extracted is not None:
-                    _before = failed_fc.get("args", {})
-                    self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
-                    self._log_fc_modify("gemini", 1, failed_fc.get("name", ""), _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", ""), model_reply=model_reply),
-                        context=clean_body.get("contents", []))
-                    if self.debug:
-                        logger.info(
-                            "Streamify [Layer1]: 成功提取 Gemini 工具 %s 的参数: %s",
-                            failed_fc.get("name"), extracted,
-                        )
-                    return web.json_response(response_data)
-                elif self.debug:
-                    logger.info("Streamify [Layer1]: Gemini JSON 参数提取失败，尝试提示注入重试")
+        target_fc = self._find_failed_function_call(response_data, tools)
+        if target_fc is None and self._hint_tools:
+            target_fc = self._find_hinted_empty_fc(response_data)
+        is_failed = target_fc is not None
 
-        retry_fc = self._find_failed_function_call(response_data, tools)
-        if retry_fc is None and self._hint_tools:
-            retry_fc = self._find_hinted_empty_fc(response_data)
-        retry_tool_name = retry_fc.get("name", "") if retry_fc else ""
-        for attempt in range(self.fix_retries):
+        if self.fc_enhance >= 2 and target_fc is None:
+            target_fc = self._find_first_function_call(response_data)
+
+        if target_fc is None:
+            return web.json_response(response_data)
+
+        # 提取模型回复文本
+        _reply_parts = []
+        for candidate in response_data.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                if isinstance(part.get("text"), str):
+                    _reply_parts.append(part["text"])
+        model_reply = "".join(_reply_parts)
+
+        function_name = target_fc.get("name", "")
+        extracted = await self._extract_args_as_json(
+            clean_body, function_name, stream_path, headers, params,
+            model_reply=model_reply,
+        )
+        if extracted is not None:
+            _before = target_fc.get("args", {})
+            self._patch_function_call_args(response_data, function_name, extracted)
+            self._log_fc_modify("gemini", 1, function_name, _before, extracted,
+                hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=model_reply),
+                context=clean_body.get("contents", []))
             if self.debug:
                 logger.info(
-                    "Streamify: 检测到空工具参数，注入提示后重试 (%d/%d)",
-                    attempt + 1, self.fix_retries,
+                    "Streamify [Layer1]: 成功提取 Gemini 工具 %s 的参数: %s",
+                    function_name, extracted,
                 )
-            current_body = self._inject_hint(clean_body, retry_tool_name)
-            if self.debug:
-                schema = self._extract_tool_schema(clean_body.get("tools", []), retry_tool_name)
-                logger.info(
-                    "Streamify debug: retry_tool_name=%r, schema_found=%s",
-                    retry_tool_name, schema is not None,
-                )
-                injected_sys = current_body.get("systemInstruction")
-                if injected_sys:
-                    parts = injected_sys.get("parts", [])
-                    if parts:
-                        hint_text = parts[-1].get("text", "")
-                        logger.info(
-                            "Streamify debug: 注入的 hint (%d chars): %s",
-                            len(hint_text), hint_text[:1000],
-                        )
-            async with self._request(
-                "POST",
-                self._build_url(stream_path),
-                json=current_body,
-                headers=headers,
-                params=params,
-            ) as resp:
-                if resp.status != 200:
-                    return web.Response(
-                        status=resp.status,
-                        headers=self._response_headers(resp),
-                        text=await resp.text(),
+            return web.json_response(response_data)
+        elif self.debug:
+            logger.info("Streamify [Layer1]: Gemini JSON 参数提取失败，尝试提示注入重试")
+
+        if is_failed:
+            for attempt in range(self.fix_retries):
+                if self.debug:
+                    logger.info(
+                        "Streamify: 检测到空工具参数，注入提示后重试 (%d/%d)",
+                        attempt + 1, self.fix_retries,
                     )
-                response_data = await self._build_non_stream_response(resp)
+                current_body = self._inject_hint(clean_body, function_name)
+                if self.debug:
+                    schema = self._extract_tool_schema(clean_body.get("tools", []), function_name)
+                    logger.info(
+                        "Streamify debug: retry_tool_name=%r, schema_found=%s",
+                        function_name, schema is not None,
+                    )
+                    injected_sys = current_body.get("systemInstruction")
+                    if injected_sys:
+                        parts = injected_sys.get("parts", [])
+                        if parts:
+                            hint_text = parts[-1].get("text", "")
+                            logger.info(
+                                "Streamify debug: 注入的 hint (%d chars): %s",
+                                len(hint_text), hint_text[:1000],
+                            )
+                async with self._request(
+                    "POST",
+                    self._build_url(stream_path),
+                    json=current_body,
+                    headers=headers,
+                    params=params,
+                ) as resp:
+                    if resp.status != 200:
+                        return web.Response(
+                            status=resp.status,
+                            headers=self._response_headers(resp),
+                            text=await resp.text(),
+                        )
+                    response_data = await self._build_non_stream_response(resp)
 
-            has_failed = self._has_failed_function_call(response_data, tools)
-            if not has_failed and self._hint_tools:
-                has_failed = self._find_hinted_empty_fc(response_data) is not None
-            if not has_failed:
-                return web.json_response(response_data)
-            if self.extract_args:
+                has_failed = self._has_failed_function_call(response_data, tools)
+                if not has_failed and self._hint_tools:
+                    has_failed = self._find_hinted_empty_fc(response_data) is not None
+                if not has_failed:
+                    return web.json_response(response_data)
                 retry_failed_fc = self._find_failed_function_call(response_data, tools)
                 if retry_failed_fc is None and self._hint_tools:
                     retry_failed_fc = self._find_hinted_empty_fc(response_data)
                 if retry_failed_fc is not None:
-                    # 提取重试响应中的模型回复文本
                     _rp = []
                     for cand in response_data.get("candidates", []):
                         for pt in (cand.get("content") or {}).get("parts", []):
@@ -472,13 +473,14 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                             )
                         return web.json_response(response_data)
 
-        failed_fc = self._find_failed_function_call(response_data, tools)
-        if failed_fc is None and self._hint_tools:
-            failed_fc = self._find_hinted_empty_fc(response_data)
-        function_name = failed_fc.get("name", "unknown") if failed_fc else "unknown"
-        logger.warning(
-            "Streamify: 工具 %s 参数在 %d 次重试后仍为空，返回原始结果",
-            function_name, self.fix_retries,
-        )
-        _inject_fc_failure_text_gemini(response_data, function_name)
+            failed_fc = self._find_failed_function_call(response_data, tools)
+            if failed_fc is None and self._hint_tools:
+                failed_fc = self._find_hinted_empty_fc(response_data)
+            fail_name = failed_fc.get("name", "unknown") if failed_fc else "unknown"
+            logger.warning(
+                "Streamify: 工具 %s 参数在 %d 次重试后仍为空，返回原始结果",
+                fail_name, self.fix_retries,
+            )
+            _inject_fc_failure_text_gemini(response_data, fail_name)
+
         return web.json_response(response_data)

@@ -25,7 +25,7 @@ class ProviderRoute:
         debug: bool = False,
         request_timeout: float = 120.0,
         pseudo_non_stream: bool = True,
-        extract_args: bool = False,
+        fc_enhance: int = 1,
         fix_retries: int = 1,
         tool_error_patterns: Optional[List[str]] = None,
         fc_context_turns: int = 1,
@@ -46,7 +46,7 @@ class ProviderRoute:
             debug=self.debug,
             request_timeout=request_timeout,
             pseudo_non_stream=pseudo_non_stream,
-            extract_args=extract_args,
+            fc_enhance=fc_enhance,
             fix_retries=fix_retries,
             tool_error_patterns=tool_error_patterns,
             fc_context_turns=fc_context_turns,
@@ -72,7 +72,7 @@ class StreamifyProxy:
         debug: bool = False,
         request_timeout: float = 120.0,
         pseudo_non_stream: bool = True,
-        extract_args: bool = False,
+        fc_enhance: int = 1,
         fix_retries: int = 1,
         tool_error_patterns: Optional[List[str]] = None,
         fc_context_turns: int = 1,
@@ -82,7 +82,7 @@ class StreamifyProxy:
         self.debug = bool(debug)
         self.request_timeout = ProviderHandler._normalize_timeout(request_timeout)
         self.pseudo_non_stream = bool(pseudo_non_stream)
-        self.extract_args = bool(extract_args)
+        self.fc_enhance = max(0, min(2, int(fc_enhance)))
         self.fix_retries = max(0, int(fix_retries))
         self.tool_error_patterns: Optional[List[str]] = tool_error_patterns
         self.fc_context_turns = max(0, int(fc_context_turns))
@@ -137,7 +137,7 @@ class StreamifyProxy:
                 debug=self.debug,
                 request_timeout=self.request_timeout,
                 pseudo_non_stream=pseudo_non_stream,
-                extract_args=self.extract_args,
+                fc_enhance=self.fc_enhance,
                 fix_retries=self.fix_retries,
                 tool_error_patterns=self.tool_error_patterns,
                 fc_context_turns=self.fc_context_turns,
