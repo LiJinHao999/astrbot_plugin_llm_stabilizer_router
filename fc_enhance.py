@@ -955,26 +955,30 @@ class GeminiFCEnhance:
         params: Dict[str, str],
         contents_override: Optional[List[Dict[str, Any]]] = None,
         model_reply: str = "",
-        model_fc_content: Optional[Dict[str, Any]] = None,
     ) -> Optional[Dict[str, Any]]:
-        """通过独立 fix 对话让模型重新产出带参数的工具调用。
+        func_desc = ""
+        func_params_schema: Dict[str, Any] = {}
+        for tool in original_body.get("tools", []):
+            for fd in tool.get("functionDeclarations", []):
+                if fd.get("name") == function_name:
+                    func_desc = fd.get("description", "")
+                    func_params_schema = fd.get("parameters", {})
+                    break
 
-        不使用 JSON 提取模式，而是保留 tools，在对话末尾追加
-        模型实际的 FC 响应 + 失败 functionResponse + 引导文本，
-        让模型自主决定如何重新调用工具。
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
 
-        model_fc_content: 模型实际返回的 content dict（含 thought_signature 等元数据），
-                          若为 None 则合成一个简单 FC（thinking model 会 400）。
-        """
-        contents = list(
+        source_contents = list(
             contents_override if contents_override is not None
             else original_body.get("contents", [])
         )
-        contents = _trim_contents_by_turns(contents, self.fc_context_turns)  # type: ignore[attr-defined]
+        source_contents = _trim_contents_by_turns(source_contents, self.fc_context_turns)  # type: ignore[attr-defined]
 
-        # ---- 收集同名工具历史调用记录 ----
+        # 收集同名工具的历史调用参数和结果
         func_resp_map: Dict[str, List[str]] = {}
-        for item in contents:
+        for item in source_contents:
             if not isinstance(item, dict) or item.get("role") != "user":
                 continue
             for part in item.get("parts", []):
@@ -989,7 +993,7 @@ class GeminiFCEnhance:
 
         history_entries: List[str] = []
         resp_idx: Dict[str, int] = {}
-        for item in contents:
+        for item in source_contents:
             if not isinstance(item, dict) or item.get("role") != "model":
                 continue
             for part in item.get("parts", []):
@@ -1010,137 +1014,71 @@ class GeminiFCEnhance:
                     entry += f"\n  结果: {res_str}"
                 history_entries.append(entry)
 
-        # ---- 构建 fix 对话 ----
-        fix_contents = list(contents)
-
-        # 追加模型的 FC 消息：优先使用原始响应（含 thought_signature），否则合成
-        last_is_model_fc = False
-        if (fix_contents
-                and isinstance(fix_contents[-1], dict)
-                and fix_contents[-1].get("role") == "model"):
-            for part in fix_contents[-1].get("parts", []):
-                if isinstance(part, dict) and part.get("functionCall"):
-                    last_is_model_fc = True
-                    break
-        if not last_is_model_fc:
-            if model_fc_content and isinstance(model_fc_content, dict):
-                fix_contents.append(model_fc_content)
-            else:
-                fix_contents.append({
-                    "role": "model",
-                    "parts": [{"functionCall": {"name": function_name, "args": {}}}],
-                })
-
-        # user 消息：functionResponse(失败) + 引导文本
-        schema = self._extract_tool_schema(original_body.get("tools", []), function_name)
-        required = (schema or {}).get("required", [])
-
-        if required:
-            params_list = "、".join(f"`{p}`" for p in required)
-            guidance = (
-                f"工具 `{function_name}` 因参数为空而调用失败。"
-                f"必填参数为 {params_list}。"
-                f"请根据上述对话内容重新调用此工具，推断每个参数的具体值，不要留空。"
-                f"尝试探索新的可能性（如更换关键词、将中文换为英文等）。"
-            )
-        else:
-            guidance = (
-                f"工具 `{function_name}` 因参数为空而调用失败。"
-                f"请根据上述对话内容重新调用此工具，为所有参数提供合理的值，"
-                f"不要使用空对象 {{}} 调用。"
-                f"尝试探索新的可能性（如更换关键词、将中文换为英文等）。"
-            )
-
+        tool_history_section = ""
         if history_entries:
-            guidance += (
-                "\n以下是该工具之前的调用记录，请避免重复使用失败的参数：\n"
-                + "\n".join(history_entries)
+            tool_history_section = (
+                "以下是该工具之前的调用历史（参数和结果），请严格避免重复使用过去的参数，探索更多可能性(如更换关键词，将中文换为英文等)：\n"
+                + "\n".join(history_entries) + "\n"
             )
 
-        fix_contents.append({
-            "role": "user",
-            "parts": [
-                {
-                    "functionResponse": {
-                        "name": function_name,
-                        "response": {
-                            "content": "调用失败：参数为空或不完整，无法执行。请重新调用并提供完整参数。",
-                        },
-                    },
-                },
-                {"text": guidance},
-            ],
-        })
-
-        self._last_extract_context = fix_contents  # type: ignore[attr-defined]
-
-        # ---- 构建 fix 专用 systemInstruction，引导模型调用工具 ----
-        func_desc = ""
-        func_schema_dict: Dict[str, Any] = {}
-        for tool in original_body.get("tools", []):
-            for fd in tool.get("functionDeclarations", []):
-                if fd.get("name") == function_name:
-                    func_desc = fd.get("description", "")
-                    func_schema_dict = fd.get("parameters", {})
-                    break
-
-        fix_system_hint = (
-            f"你是一个工具调用助手。你必须调用工具 `{function_name}` 来完成用户的请求。\n"
+        tool_system = (
+            f"你是一个参数推断助手。工具 `{function_name}` 刚才因参数为空而调用失败。\n"
             f"工具说明：{func_desc}\n"
-            f"参数 schema：{json.dumps(func_schema_dict, ensure_ascii=False)}\n"
-            "请仔细分析对话上下文，从中推断出每个参数的具体值，然后调用该工具。\n"
-            "不要回复文本，必须直接调用工具。"
+            f"参数 schema：{json.dumps(func_params_schema, ensure_ascii=False)}\n"
+            f"{model_reply_section}"
+            f"{tool_history_section}"
+            "请仔细分析以下完整对话上下文，推断出调用该工具所需的参数。\n"
+            "如果之前的参数导致了失败，请尝试新的思路（如更换关键词、将中文换为英文等）。\n"
+            "你只输出并且必须输出 JSON 参数对象。"
         )
 
-        # 在原始 systemInstruction 基础上追加 fix 提示
-        fix_body: Dict[str, Any] = {"contents": fix_contents}
-        for key in ("tools", "toolConfig", "safetySettings"):
-            if key in original_body:
-                fix_body[key] = original_body[key]
-        sys_inst = original_body.get("systemInstruction")
-        if isinstance(sys_inst, dict):
-            parts = list(sys_inst.get("parts", []))
-            parts.append({"text": fix_system_hint})
-            fix_body["systemInstruction"] = {**sys_inst, "parts": parts}
-        else:
-            fix_body["systemInstruction"] = {"parts": [{"text": fix_system_hint}]}
+        # 提取对话中的纯文本，去除 functionCall / functionResponse
+        context_lines: List[str] = []
+        for item in source_contents:
+            if not isinstance(item, dict):
+                continue
+            role = item.get("role", "")
+            for part in item.get("parts", []):
+                if not isinstance(part, dict):
+                    continue
+                if "functionCall" in part or "functionResponse" in part:
+                    continue
+                text = part.get("text", "")
+                if not text:
+                    continue
+                text = _strip_system_tags(text)
+                if not text.strip():
+                    continue
+                prefix = "用户" if role == "user" else "模型"
+                context_lines.append(f"{prefix}: {text}")
 
-        gen_cfg = dict(original_body.get("generationConfig") or {})
-        gen_cfg.pop("responseMimeType", None)
-        gen_cfg.pop("responseSchema", None)
-        if gen_cfg:
-            fix_body["generationConfig"] = gen_cfg
+        contents_for_extract: List[Dict[str, Any]] = []
+        if context_lines:
+            contents_for_extract.append({
+                "role": "user",
+                "parts": [{"text": "\n".join(context_lines)}],
+            })
+        self._last_extract_context = contents_for_extract  # type: ignore[attr-defined]
 
-        logger.info(
-            "Streamify [fix对话]: 工具 %s, contents 共 %d 条, 引导: %s",
-            function_name, len(fix_contents),
-            guidance[:120] + "…" if len(guidance) > 120 else guidance,
-        )
+        extract_body: Dict[str, Any] = {
+            "contents": contents_for_extract,
+            "systemInstruction": {"parts": [{"text": tool_system}]},
+            "generationConfig": {"responseMimeType": "application/json"},
+        }
+        if "safetySettings" in original_body:
+            extract_body["safetySettings"] = original_body["safetySettings"]
 
         try:
             async with self._request(  # type: ignore[attr-defined]
                 "POST",
                 self._build_url(stream_path),  # type: ignore[attr-defined]
-                json=fix_body,
+                json=extract_body,
                 headers=headers,
                 params=params,
             ) as resp:
                 if resp.status != 200:
-                    err_text = ""
-                    try:
-                        err_text = await resp.text()
-                        if len(err_text) > 500:
-                            err_text = err_text[:500] + "…"
-                    except Exception:
-                        pass
-                    logger.warning(
-                        "Streamify [fix对话]: API 返回 %d，工具 %s，详情: %s",
-                        resp.status, function_name, err_text,
-                    )
                     return None
-                result_args: Optional[Dict[str, Any]] = None
-                all_fc_names: List[str] = []
-                has_text = False
+                text_parts: List[str] = []
                 async for _event, data in self._iter_sse_events(resp):  # type: ignore[attr-defined]
                     if not data:
                         continue
@@ -1148,34 +1086,22 @@ class GeminiFCEnhance:
                         chunk = json.loads(data)
                         for cand in chunk.get("candidates", []):
                             for part in (cand.get("content") or {}).get("parts", []):
-                                if isinstance(part.get("text"), str) and part["text"].strip():
-                                    has_text = True
-                                _fc = part.get("functionCall")
-                                if isinstance(_fc, dict):
-                                    fc_name = _fc.get("name", "")
-                                    fc_args = _fc.get("args")
-                                    all_fc_names.append(fc_name)
-                                    if (fc_name == function_name
-                                            and isinstance(fc_args, dict)
-                                            and fc_args
-                                            and result_args is None):
-                                        result_args = fc_args
+                                t = part.get("text")
+                                if isinstance(t, str) and t.strip():
+                                    text_parts.append(t)
                     except Exception:
                         continue
-                if result_args is not None:
-                    logger.info(
-                        "Streamify [fix对话]: 工具 %s 成功获取参数: %s",
-                        function_name, json.dumps(result_args, ensure_ascii=False),
+                if not text_parts:
+                    return None
+                text = "".join(text_parts).strip()
+                if text.startswith("```"):
+                    lines = text.splitlines()
+                    text = "\n".join(
+                        lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
                     )
-                else:
-                    logger.info(
-                        "Streamify [fix对话]: 工具 %s 未获取到有效参数，"
-                        "响应中的 FC=%s, 有文本=%s",
-                        function_name, all_fc_names or "无", has_text,
-                    )
-                return result_args
-        except Exception as exc:
-            logger.warning("Streamify [fix对话]: 请求异常 %s: %s", function_name, exc)
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, dict) and parsed else None
+        except Exception:
             return None
 
     @staticmethod
