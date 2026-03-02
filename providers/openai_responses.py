@@ -170,15 +170,17 @@ class OpenAIResponsesHandler(ProviderHandler, OpenAIResponsesFakeNonStream, Open
 
         # 需要修复
         result = completed_data
+        model_reply = self._extract_text_from_response(completed_data)
 
         if self.extract_args:
             fn_name = failed.get("name", "")
-            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                         model_reply=model_reply)
             if extracted is not None:
                 _before = failed.get("arguments", "{}")
                 self._patch_function_call_args(result, fn_name, extracted)
                 self._log_fc_modify("openai_responses", 1, fn_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                     context=clean_body.get("input", []))
                 if self.debug:
                     logger.info("Streamify [Layer1]: 成功提取 Responses 工具 %s 参数(流式)", fn_name)
@@ -214,12 +216,13 @@ class OpenAIResponsesHandler(ProviderHandler, OpenAIResponsesFakeNonStream, Open
 
             if self.extract_args:
                 fn_name = failed.get("name", "")
-                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                             model_reply=model_reply)
                 if extracted is not None:
                     _before = failed.get("arguments", "{}")
                     self._patch_function_call_args(result, fn_name, extracted)
                     self._log_fc_modify("openai_responses", 1, fn_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                         context=clean_body.get("input", []))
                     completed_evt = json.dumps({"type": "response.completed", "response": result})
                     await client.write(f"event: response.completed\ndata: {completed_evt}\n\n".encode())
@@ -315,12 +318,15 @@ class OpenAIResponsesHandler(ProviderHandler, OpenAIResponsesFakeNonStream, Open
 
         if self.extract_args:
             fn_name = failed.get("name", "")
-            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+            # 提取模型回复文本
+            model_reply = self._extract_text_from_response(result)
+            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                         model_reply=model_reply)
             if extracted is not None:
                 _before = failed.get("arguments", "{}")
                 self._patch_function_call_args(result, fn_name, extracted)
                 self._log_fc_modify("openai_responses", 1, fn_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                     context=clean_body.get("input", []))
                 if self.debug:
                     logger.info("Streamify [Layer1]: 成功提取 Responses 工具 %s 的参数: %s", fn_name, extracted)
@@ -353,12 +359,15 @@ class OpenAIResponsesHandler(ProviderHandler, OpenAIResponsesFakeNonStream, Open
                 return web.json_response(result)
             if self.extract_args:
                 fn_name = failed.get("name", "")
-                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+                # 提取重试响应中的模型回复文本
+                _retry_reply = self._extract_text_from_response(result)
+                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                             model_reply=_retry_reply)
                 if extracted is not None:
                     _before = failed.get("arguments", "{}")
                     self._patch_function_call_args(result, fn_name, extracted)
                     self._log_fc_modify("openai_responses", 1, fn_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=_retry_reply),
                         context=clean_body.get("input", []))
                     if self.debug:
                         logger.info("Streamify [Layer1]: 成功提取 Responses 工具 %s 的参数: %s", fn_name, extracted)

@@ -120,6 +120,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
 
             fc_buffer: List[Dict[str, Any]] = []  # 含 functionCall 的 payloads
             fc_detected = False
+            forwarded_text = ""  # 累加已转发的文本，用于 extract_args
 
             async for _, data in self._iter_sse_events(resp):
                 try:
@@ -134,6 +135,11 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     fc_detected = True
                     fc_buffer.append(payload)
                 else:
+                    # 累加已转发 payload 中的文本
+                    for candidate in (payload.get("candidates") or []):
+                        for part in ((candidate.get("content") or {}).get("parts") or []):
+                            if isinstance(part.get("text"), str):
+                                forwarded_text += part["text"]
                     await client.write(f"data: {json.dumps(payload)}\n\n".encode())
 
         if not fc_detected:
@@ -156,19 +162,28 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             return client
 
         # 需要修复：Layer 1 + 重试
+        # 提取模型回复文本（已转发文本 + FC 响应中的文本 parts）
+        _reply_parts = []
+        for candidate in response_data.get("candidates", []):
+            for part in (candidate.get("content") or {}).get("parts", []):
+                if isinstance(part.get("text"), str):
+                    _reply_parts.append(part["text"])
+        model_reply = forwarded_text + "".join(_reply_parts)
+
         if self.extract_args:
             failed_fc = self._find_failed_function_call(response_data, tools)
             if failed_fc is None and self._hint_tools:
                 failed_fc = self._find_hinted_empty_fc(response_data)
             if failed_fc is not None:
                 extracted = await self._extract_args_as_json(
-                    clean_body, failed_fc.get("name", ""), stream_path, headers, params
+                    clean_body, failed_fc.get("name", ""), stream_path, headers, params,
+                    model_reply=model_reply,
                 )
                 if extracted is not None:
                     _before = failed_fc.get("args", {})
                     self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
                     self._log_fc_modify("gemini", 1, failed_fc.get("name", ""), _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", "")),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", ""), model_reply=model_reply),
                         context=clean_body.get("contents", []))
                     if self.debug:
                         logger.info("Streamify [Layer1]: 成功提取 Gemini 工具 %s 参数(流式)", failed_fc.get("name"))
@@ -209,13 +224,14 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     retry_failed_fc = self._find_hinted_empty_fc(response_data)
                 if retry_failed_fc is not None:
                     extracted = await self._extract_args_as_json(
-                        clean_body, retry_failed_fc.get("name", ""), stream_path, headers, params
+                        clean_body, retry_failed_fc.get("name", ""), stream_path, headers, params,
+                        model_reply=model_reply,
                     )
                     if extracted is not None:
                         _before = retry_failed_fc.get("args", {})
                         self._patch_function_call_args(response_data, retry_failed_fc.get("name", ""), extracted)
                         self._log_fc_modify("gemini", 1, retry_failed_fc.get("name", ""), _before, extracted,
-                            hint=self._build_extract_hint(clean_body.get("tools", []), retry_failed_fc.get("name", "")),
+                            hint=self._build_extract_hint(clean_body.get("tools", []), retry_failed_fc.get("name", ""), model_reply=model_reply),
                             context=clean_body.get("contents", []))
                         await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
                         await client.write_eof()
@@ -353,14 +369,22 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             if failed_fc is None and self._hint_tools:
                 failed_fc = self._find_hinted_empty_fc(response_data)
             if failed_fc is not None:
+                # 提取模型回复文本
+                _reply_parts = []
+                for candidate in response_data.get("candidates", []):
+                    for part in (candidate.get("content") or {}).get("parts", []):
+                        if isinstance(part.get("text"), str):
+                            _reply_parts.append(part["text"])
+                model_reply = "".join(_reply_parts)
                 extracted = await self._extract_args_as_json(
-                    clean_body, failed_fc.get("name", ""), stream_path, headers, params
+                    clean_body, failed_fc.get("name", ""), stream_path, headers, params,
+                    model_reply=model_reply,
                 )
                 if extracted is not None:
                     _before = failed_fc.get("args", {})
                     self._patch_function_call_args(response_data, failed_fc.get("name", ""), extracted)
                     self._log_fc_modify("gemini", 1, failed_fc.get("name", ""), _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", "")),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), failed_fc.get("name", ""), model_reply=model_reply),
                         context=clean_body.get("contents", []))
                     if self.debug:
                         logger.info(
@@ -422,8 +446,16 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                 if retry_failed_fc is None and self._hint_tools:
                     retry_failed_fc = self._find_hinted_empty_fc(response_data)
                 if retry_failed_fc is not None:
+                    # 提取重试响应中的模型回复文本
+                    _rp = []
+                    for cand in response_data.get("candidates", []):
+                        for pt in (cand.get("content") or {}).get("parts", []):
+                            if isinstance(pt.get("text"), str):
+                                _rp.append(pt["text"])
+                    _retry_reply = "".join(_rp)
                     extracted = await self._extract_args_as_json(
-                        clean_body, retry_failed_fc.get("name", ""), stream_path, headers, params
+                        clean_body, retry_failed_fc.get("name", ""), stream_path, headers, params,
+                        model_reply=_retry_reply,
                     )
                     if extracted is not None:
                         _before = retry_failed_fc.get("args", {})
@@ -431,7 +463,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                             response_data, retry_failed_fc.get("name", ""), extracted
                         )
                         self._log_fc_modify("gemini", 1, retry_failed_fc.get("name", ""), _before, extracted,
-                            hint=self._build_extract_hint(clean_body.get("tools", []), retry_failed_fc.get("name", "")),
+                            hint=self._build_extract_hint(clean_body.get("tools", []), retry_failed_fc.get("name", ""), model_reply=_retry_reply),
                             context=clean_body.get("contents", []))
                         if self.debug:
                             logger.info(

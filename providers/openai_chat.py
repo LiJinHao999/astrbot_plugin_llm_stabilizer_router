@@ -171,6 +171,7 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
             base_meta: Dict[str, Any] = {"id": "", "model": "", "created": 0}
             tc_buffer: List[Dict[str, Any]] = []
             tc_detected = False
+            forwarded_text = ""  # 累加已转发的文本，用于 extract_args
 
             async for _, data in self._iter_sse_events(resp):
                 if data == "[DONE]":
@@ -202,6 +203,11 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
                     tc_detected = True
                     tc_buffer.append(chunk)
                 else:
+                    # 累加已转发 chunk 中的文本
+                    for c in choices:
+                        delta_content = (c.get("delta") or {}).get("content")
+                        if isinstance(delta_content, str):
+                            forwarded_text += delta_content
                     await client.write(f"data: {json.dumps(chunk)}\n\n".encode())
 
         # 纯文本响应：文本已实时发出，直接结束
@@ -228,15 +234,17 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
 
         # 需要修复：Layer 1 + 重试
         result = assembled
+        model_reply = forwarded_text
 
         if self.extract_args:
             fn_name = (failed.get("function") or {}).get("name", "")
-            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                         model_reply=model_reply)
             if extracted is not None:
                 _before = (failed.get("function") or {}).get("arguments", "{}")
                 self._patch_function_call_args(result, fn_name, extracted)
                 self._log_fc_modify("openai", 1, fn_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                     context=clean_body.get("messages", []))
                 if self.debug:
                     logger.info("Streamify [Layer1]: 成功提取 OpenAI 工具 %s 参数(流式)", fn_name)
@@ -272,12 +280,13 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
 
             if self.extract_args:
                 fn_name = (failed.get("function") or {}).get("name", "")
-                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                             model_reply=model_reply)
                 if extracted is not None:
                     _before = (failed.get("function") or {}).get("arguments", "{}")
                     self._patch_function_call_args(result, fn_name, extracted)
                     self._log_fc_modify("openai", 1, fn_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                         context=clean_body.get("messages", []))
                     await self._write_tc_sse(client, result, base_meta)
                     await client.write(b"data: [DONE]\n\n")
@@ -379,14 +388,17 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
 
         if self.extract_args:
             function_name = (failed_tc.get("function") or {}).get("name", "")
+            # 提取模型回复文本
+            model_reply = (result.get("choices", [{}])[0].get("message") or {}).get("content", "") or ""
             extracted = await self._extract_args_as_json(
-                clean_body, function_name, sub_path, headers
+                clean_body, function_name, sub_path, headers,
+                model_reply=model_reply,
             )
             if extracted is not None:
                 _before = (failed_tc.get("function") or {}).get("arguments", "{}")
                 self._patch_function_call_args(result, function_name, extracted)
                 self._log_fc_modify("openai", 1, function_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), function_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=model_reply),
                     context=clean_body.get("messages", []))
                 if self.debug:
                     logger.info(
@@ -427,14 +439,17 @@ class OpenAIChatHandler(ProviderHandler, OpenAIFakeNonStream, OpenAIFCEnhance):
                 return web.json_response(result)
             if self.extract_args:
                 function_name = (failed_tc.get("function") or {}).get("name", "")
+                # 提取重试响应中的模型回复文本
+                _retry_reply = (result.get("choices", [{}])[0].get("message") or {}).get("content", "") or ""
                 extracted = await self._extract_args_as_json(
-                    clean_body, function_name, sub_path, headers
+                    clean_body, function_name, sub_path, headers,
+                    model_reply=_retry_reply,
                 )
                 if extracted is not None:
                     _before = (failed_tc.get("function") or {}).get("arguments", "{}")
                     self._patch_function_call_args(result, function_name, extracted)
                     self._log_fc_modify("openai", 1, function_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), function_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=_retry_reply),
                         context=clean_body.get("messages", []))
                     if self.debug:
                         logger.info(

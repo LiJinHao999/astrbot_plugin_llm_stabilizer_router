@@ -54,13 +54,21 @@ def _trim_contents_by_turns(
 
 
 _EXTRACT_PROMPT_TEMPLATE = (
-    "你是一个参数提取助手。用户正在使用工具 `{function_name}`。\n"
+    "你是一个工具调用助手。用户正在使用工具 `{function_name}`。\n"
     "工具说明：{func_desc}\n"
     "参数 schema：{func_schema}\n"
+    "{model_reply_section}"
     "请仔细分析以下完整对话上下文（包括用户消息、助手回复和工具调用结果），"
     "从中提取调用该工具所需的参数。\n"
     "只输出 JSON 参数对象，不要包含任何其他文字。"
 )
+
+
+def _strip_system_tags(text: str) -> str:
+    """去除 <system_reminder> 和 <conversation_scene> 标签及其内容。"""
+    text = re.sub(r'<system_reminder>.*?</system_reminder>', '', text, flags=re.DOTALL)
+    text = re.sub(r'<conversation_scene>.*?</conversation_scene>', '', text, flags=re.DOTALL)
+    return text
 
 
 def _compile_error_patterns(patterns: List[str]) -> List[Pattern[str]]:
@@ -106,7 +114,7 @@ class OpenAIFCEnhance:
         return None
 
     @staticmethod
-    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str) -> str:
+    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str, model_reply: str = "") -> str:
         """构建 extract_args 使用的提示词，用于 debug 日志。"""
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -116,10 +124,15 @@ class OpenAIFCEnhance:
                 func_desc = fn.get("description", "")
                 func_schema = fn.get("parameters", {})
                 break
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值或意图）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         return _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
     @staticmethod
@@ -229,6 +242,7 @@ class OpenAIFCEnhance:
         sub_path: str,
         headers: Dict[str, str],
         messages_override: Optional[List[Dict[str, Any]]] = None,
+        model_reply: str = "",
     ) -> Optional[Dict[str, Any]]:
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -239,10 +253,15 @@ class OpenAIFCEnhance:
                 func_schema = fn.get("parameters", {})
                 break
 
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         tool_system = _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
         source_messages = (
@@ -253,6 +272,18 @@ class OpenAIFCEnhance:
         messages = [{"role": "system", "content": tool_system}]
         for msg in source_messages:
             if isinstance(msg, dict) and msg.get("role") != "system":
+                if msg.get("role") == "user":
+                    content = msg.get("content", "")
+                    if isinstance(content, str):
+                        msg = {**msg, "content": _strip_system_tags(content)}
+                    elif isinstance(content, list):
+                        new_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                                new_parts.append({**part, "text": _strip_system_tags(part["text"])})
+                            else:
+                                new_parts.append(part)
+                        msg = {**msg, "content": new_parts}
                 messages.append(msg)
 
         extract_body: Dict[str, Any] = {
@@ -345,7 +376,7 @@ class ClaudeFCEnhance:
         return None
 
     @staticmethod
-    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str) -> str:
+    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str, model_reply: str = "") -> str:
         """构建 extract_args 使用的提示词，用于 debug 日志。"""
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -354,10 +385,15 @@ class ClaudeFCEnhance:
                 func_desc = tool.get("description", "")
                 func_schema = tool.get("input_schema", {})
                 break
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         return _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
     @staticmethod
@@ -468,6 +504,7 @@ class ClaudeFCEnhance:
         sub_path: str,
         headers: Dict[str, str],
         messages_override: Optional[List[Dict[str, Any]]] = None,
+        model_reply: str = "",
     ) -> Optional[Dict[str, Any]]:
         func_desc = ""
         input_schema: Dict[str, Any] = {}
@@ -479,10 +516,15 @@ class ClaudeFCEnhance:
                 input_schema = tool.get("input_schema", {})
                 break
 
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         tool_system = _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(input_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
         source_messages = (
@@ -490,11 +532,28 @@ class ClaudeFCEnhance:
             else original_body.get("messages", [])
         )
         source_messages = _trim_messages_by_turns(source_messages, self.fc_context_turns)  # type: ignore[attr-defined]
+        cleaned_messages: List[Dict[str, Any]] = []
+        for msg in source_messages:
+            if not isinstance(msg, dict):
+                continue
+            if msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str):
+                    msg = {**msg, "content": _strip_system_tags(content)}
+                elif isinstance(content, list):
+                    new_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                            new_parts.append({**part, "text": _strip_system_tags(part["text"])})
+                        else:
+                            new_parts.append(part)
+                    msg = {**msg, "content": new_parts}
+            cleaned_messages.append(msg)
         extract_body: Dict[str, Any] = {
             "model": original_body.get("model", ""),
             "max_tokens": original_body.get("max_tokens", 1024),
             "system": tool_system,
-            "messages": source_messages,
+            "messages": cleaned_messages,
             "stream": True,
         }
 
@@ -579,7 +638,7 @@ class GeminiFCEnhance:
         return None
 
     @staticmethod
-    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str) -> str:
+    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str, model_reply: str = "") -> str:
         """构建 extract_args 使用的提示词，用于 debug 日志。"""
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -589,10 +648,15 @@ class GeminiFCEnhance:
                     func_desc = fd.get("description", "")
                     func_schema = fd.get("parameters", {})
                     break
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         return _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
     @staticmethod
@@ -691,6 +755,7 @@ class GeminiFCEnhance:
         headers: Dict[str, str],
         params: Dict[str, str],
         contents_override: Optional[List[Dict[str, Any]]] = None,
+        model_reply: str = "",
     ) -> Optional[Dict[str, Any]]:
         """构造聚焦请求：只含工具说明 + 参数 schema + 对话上下文，让模型输出 JSON 参数。"""
         func_desc = ""
@@ -702,10 +767,15 @@ class GeminiFCEnhance:
                     func_params_schema = fd.get("parameters", {})
                     break
 
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         tool_system = _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_params_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
         contents = list(
@@ -713,12 +783,24 @@ class GeminiFCEnhance:
             else original_body.get("contents", [])
         )
         contents = _trim_contents_by_turns(contents, self.fc_context_turns)  # type: ignore[attr-defined]
+        cleaned_contents: List[Dict[str, Any]] = []
+        for item in contents:
+            if isinstance(item, dict) and item.get("role") == "user":
+                new_parts = []
+                for part in item.get("parts", []):
+                    if isinstance(part, dict) and isinstance(part.get("text"), str):
+                        new_parts.append({**part, "text": _strip_system_tags(part["text"])})
+                    else:
+                        new_parts.append(part)
+                cleaned_contents.append({**item, "parts": new_parts})
+            else:
+                cleaned_contents.append(item)
 
         gen_cfg = dict(original_body.get("generationConfig") or {})
         gen_cfg["responseMimeType"] = "application/json"
 
         extract_body: Dict[str, Any] = {
-            "contents": contents,
+            "contents": cleaned_contents,
             "systemInstruction": {"parts": [{"text": tool_system}]},
             "generationConfig": gen_cfg,
             # 不传 tools，避免模型再次发出空的 functionCall
@@ -811,7 +893,7 @@ class OpenAIResponsesFCEnhance:
         return None
 
     @staticmethod
-    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str) -> str:
+    def _build_extract_hint(tools: List[Dict[str, Any]], function_name: str, model_reply: str = "") -> str:
         """构建 extract_args 使用的提示词，用于 debug 日志。"""
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -820,10 +902,15 @@ class OpenAIResponsesFCEnhance:
                 func_desc = tool.get("description", "")
                 func_schema = tool.get("parameters", {})
                 break
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         return _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
     @staticmethod
@@ -916,6 +1003,7 @@ class OpenAIResponsesFCEnhance:
         sub_path: str,
         headers: Dict[str, str],
         input_override: Optional[List[Dict[str, Any]]] = None,
+        model_reply: str = "",
     ) -> Optional[Dict[str, Any]]:
         func_desc = ""
         func_schema: Dict[str, Any] = {}
@@ -925,10 +1013,15 @@ class OpenAIResponsesFCEnhance:
                 func_schema = tool.get("parameters", {})
                 break
 
+        model_reply_section = (
+            f"模型已生成的回复文本（请优先从中提取具体参数值）：\n{model_reply}\n"
+            if model_reply else ""
+        )
         tool_system = _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
             func_schema=json.dumps(func_schema, ensure_ascii=False),
+            model_reply_section=model_reply_section,
         )
 
         source_input = (
@@ -937,6 +1030,22 @@ class OpenAIResponsesFCEnhance:
         )
         if isinstance(source_input, list):
             source_input = _trim_messages_by_turns(source_input, self.fc_context_turns, user_role="user")  # type: ignore[attr-defined]
+            cleaned_input: List[Dict[str, Any]] = []
+            for item in source_input:
+                if isinstance(item, dict) and item.get("role") == "user":
+                    content = item.get("content", "")
+                    if isinstance(content, str):
+                        item = {**item, "content": _strip_system_tags(content)}
+                    elif isinstance(content, list):
+                        new_parts = []
+                        for part in content:
+                            if isinstance(part, dict) and part.get("type") == "input_text" and isinstance(part.get("text"), str):
+                                new_parts.append({**part, "text": _strip_system_tags(part["text"])})
+                            else:
+                                new_parts.append(part)
+                        item = {**item, "content": new_parts}
+                cleaned_input.append(item)
+            source_input = cleaned_input
 
         extract_body: Dict[str, Any] = {
             "model": original_body.get("model", ""),

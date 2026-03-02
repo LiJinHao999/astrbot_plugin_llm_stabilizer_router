@@ -164,6 +164,7 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
             tc_blocks: Dict[int, Dict[str, Any]] = {}  # index -> {id, name, _input}
             # 非 tool_use content block 的最大 index + 1（用于 start_idx 计算）
             max_forwarded_idx: int = -1
+            forwarded_text = ""  # 累加已转发的文本，用于 extract_args
 
             async for event_name, data in self._iter_sse_events(resp):
                 try:
@@ -209,6 +210,10 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
                             tc_blocks[idx]["_input"] += delta.get("partial_json", "")
                         tc_buffer.append((event_name, payload))
                     else:
+                        # 累加已转发的文本 delta
+                        delta = payload.get("delta") or {}
+                        if delta.get("type") == "text_delta":
+                            forwarded_text += delta.get("text", "")
                         await self._write_event(client, event_name, payload)
 
                 elif event_type == "content_block_stop":
@@ -269,15 +274,17 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
 
         # 需要修复：Layer 1 + 重试
         result = assembled
+        model_reply = forwarded_text
 
         if self.extract_args:
             fn_name = failed.get("name", "")
-            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+            extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                         model_reply=model_reply)
             if extracted is not None:
                 _before = failed.get("input", {})
                 self._patch_function_call_args(result, fn_name, extracted)
                 self._log_fc_modify("claude", 1, fn_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                     context=clean_body.get("messages", []))
                 if self.debug:
                     logger.info("Streamify [Layer1]: 成功提取 Claude 工具 %s 参数(流式)", fn_name)
@@ -311,12 +318,13 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
 
             if self.extract_args:
                 fn_name = failed.get("name", "")
-                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers)
+                extracted = await self._extract_args_as_json(clean_body, fn_name, sub_path, headers,
+                                                             model_reply=model_reply)
                 if extracted is not None:
                     _before = failed.get("input", {})
                     self._patch_function_call_args(result, fn_name, extracted)
                     self._log_fc_modify("claude", 1, fn_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), fn_name, model_reply=model_reply),
                         context=clean_body.get("messages", []))
                     await self._write_tc_events(client, result, start_idx, msg_meta)
                     await client.write_eof()
@@ -411,14 +419,21 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
 
         if self.extract_args:
             function_name = failed_tc.get("name", "")
+            # 提取模型回复文本
+            _reply_parts = []
+            for block in result.get("content", []):
+                if isinstance(block, dict) and block.get("type") == "text":
+                    _reply_parts.append(block.get("text", ""))
+            model_reply = "".join(_reply_parts)
             extracted = await self._extract_args_as_json(
-                clean_body, function_name, sub_path, headers
+                clean_body, function_name, sub_path, headers,
+                model_reply=model_reply,
             )
             if extracted is not None:
                 _before = failed_tc.get("input", {})
                 self._patch_function_call_args(result, function_name, extracted)
                 self._log_fc_modify("claude", 1, function_name, _before, extracted,
-                    hint=self._build_extract_hint(clean_body.get("tools", []), function_name),
+                    hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=model_reply),
                     context=clean_body.get("messages", []))
                 if self.debug:
                     logger.info(
@@ -459,14 +474,21 @@ class ClaudeHandler(ProviderHandler, ClaudeFakeNonStream, ClaudeFCEnhance):
                 return web.json_response(result)
             if self.extract_args:
                 function_name = failed_tc.get("name", "")
+                # 提取重试响应中的模型回复文本
+                _rp = []
+                for blk in result.get("content", []):
+                    if isinstance(blk, dict) and blk.get("type") == "text":
+                        _rp.append(blk.get("text", ""))
+                _retry_reply = "".join(_rp)
                 extracted = await self._extract_args_as_json(
-                    clean_body, function_name, sub_path, headers
+                    clean_body, function_name, sub_path, headers,
+                    model_reply=_retry_reply,
                 )
                 if extracted is not None:
                     _before = failed_tc.get("input", {})
                     self._patch_function_call_args(result, function_name, extracted)
                     self._log_fc_modify("claude", 1, function_name, _before, extracted,
-                        hint=self._build_extract_hint(clean_body.get("tools", []), function_name),
+                        hint=self._build_extract_hint(clean_body.get("tools", []), function_name, model_reply=_retry_reply),
                         context=clean_body.get("messages", []))
                     if self.debug:
                         logger.info(
