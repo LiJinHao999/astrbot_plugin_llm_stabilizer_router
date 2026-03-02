@@ -87,6 +87,39 @@ def _strip_system_tags(text: str) -> str:
     return text
 
 
+def _extract_text_from_openai_msg(msg: Dict[str, Any]) -> str:
+    """从 OpenAI 格式消息中提取纯文本，去除 system tags 和非文本内容。"""
+    content = msg.get("content", "")
+    if isinstance(content, str):
+        return _strip_system_tags(content).strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
+                cleaned = _strip_system_tags(part["text"]).strip()
+                if cleaned:
+                    parts.append(cleaned)
+        return "\n".join(parts)
+    return ""
+
+
+def _extract_text_from_responses_item(item: Dict[str, Any]) -> str:
+    """从 Responses API 格式的 input item 中提取纯文本。"""
+    content = item.get("content", "")
+    if isinstance(content, str):
+        return _strip_system_tags(content).strip()
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            if isinstance(part, dict) and isinstance(part.get("text"), str):
+                # 支持 input_text / output_text 等带 text 字段的 part
+                cleaned = _strip_system_tags(part["text"]).strip()
+                if cleaned:
+                    parts.append(cleaned)
+        return "\n".join(parts)
+    return ""
+
+
 def _compile_error_patterns(patterns: List[str]) -> List[Pattern[str]]:
     """编译正则列表，跳过无效规则并记录警告。"""
     compiled: List[Pattern[str]] = []
@@ -296,44 +329,22 @@ class OpenAIFCEnhance:
             else original_body.get("messages", [])
         )
         source_messages = _trim_messages_by_turns(source_messages, self.fc_context_turns)  # type: ignore[attr-defined]
-        messages = [{"role": "system", "content": tool_system}]
+        # 提取所有消息的纯文本，扁平化为单条 user 消息发送
+        context_lines: List[str] = []
         for msg in source_messages:
             if not isinstance(msg, dict):
                 continue
             role = msg.get("role")
-            if role == "system":
+            if role in ("system", "tool"):
                 continue
-            # 跳过工具执行结果消息
-            if role == "tool":
+            text = _extract_text_from_openai_msg(msg)
+            if not text:
                 continue
-            if role == "user":
-                content = msg.get("content", "")
-                if isinstance(content, str):
-                    cleaned = _strip_system_tags(content)
-                    if not cleaned.strip():
-                        continue
-                    msg = {**msg, "content": cleaned}
-                elif isinstance(content, list):
-                    new_parts = []
-                    for part in content:
-                        if isinstance(part, dict) and part.get("type") == "text" and isinstance(part.get("text"), str):
-                            cleaned = _strip_system_tags(part["text"])
-                            if cleaned.strip():
-                                new_parts.append({**part, "text": cleaned})
-                        else:
-                            new_parts.append(part)
-                    if not new_parts:
-                        continue
-                    msg = {**msg, "content": new_parts}
-            elif role == "assistant":
-                # 去除 tool_calls / function_call，只保留文本内容
-                cleaned_msg: Dict[str, Any] = {k: v for k, v in msg.items()
-                                                if k not in ("tool_calls", "function_call")}
-                content = cleaned_msg.get("content")
-                if not content and not cleaned_msg.get("refusal"):
-                    continue
-                msg = cleaned_msg
-            messages.append(msg)
+            prefix = "用户" if role == "user" else "助手"
+            context_lines.append(f"{prefix}: {text}")
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": tool_system}]
+        if context_lines:
+            messages.append({"role": "user", "content": "\n".join(context_lines)})
 
         extract_body: Dict[str, Any] = {
             "model": original_body.get("model", ""),
@@ -365,7 +376,7 @@ class OpenAIFCEnhance:
                         lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
                     )
                 parsed = json.loads(content)
-                return parsed if isinstance(parsed, dict) else None
+                return parsed if isinstance(parsed, dict) and parsed else None
         except Exception:
             return None
 
@@ -659,7 +670,7 @@ class ClaudeFCEnhance:
                                     lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
                                 )
                             parsed = json.loads(text)
-                            return parsed if isinstance(parsed, dict) else None
+                            return parsed if isinstance(parsed, dict) and parsed else None
                 return None
         except Exception:
             return None
@@ -955,7 +966,7 @@ class GeminiFCEnhance:
                         lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
                     )
                 result = json.loads(text)
-                return result if isinstance(result, dict) else None
+                return result if isinstance(result, dict) and result else None
         except Exception:
             return None
 
@@ -1156,42 +1167,30 @@ class OpenAIResponsesFCEnhance:
             input_override if input_override is not None
             else original_body.get("input", [])
         )
+        extract_input: Any = []
         if isinstance(source_input, list):
             source_input = _trim_messages_by_turns(source_input, self.fc_context_turns, user_role="user")  # type: ignore[attr-defined]
-            cleaned_input: List[Dict[str, Any]] = []
+            # 提取所有消息的纯文本，扁平化为单条 user 消息
+            context_lines: List[str] = []
             for item in source_input:
                 if not isinstance(item, dict):
                     continue
                 item_type = item.get("type", "")
-                # 跳过 function_call 和 function_call_output（工具调用及结果）
                 if item_type in ("function_call", "function_call_output"):
                     continue
-                if item.get("role") == "user":
-                    content = item.get("content", "")
-                    if isinstance(content, str):
-                        cleaned = _strip_system_tags(content)
-                        if not cleaned.strip():
-                            continue
-                        item = {**item, "content": cleaned}
-                    elif isinstance(content, list):
-                        new_parts = []
-                        for part in content:
-                            if isinstance(part, dict) and part.get("type") == "input_text" and isinstance(part.get("text"), str):
-                                cleaned = _strip_system_tags(part["text"])
-                                if cleaned.strip():
-                                    new_parts.append({**part, "text": cleaned})
-                            else:
-                                new_parts.append(part)
-                        if not new_parts:
-                            continue
-                        item = {**item, "content": new_parts}
-                cleaned_input.append(item)
-            source_input = cleaned_input
+                text = _extract_text_from_responses_item(item)
+                if not text:
+                    continue
+                role = item.get("role", "")
+                prefix = "用户" if role == "user" else "助手"
+                context_lines.append(f"{prefix}: {text}")
+            if context_lines:
+                extract_input = "\n".join(context_lines)
 
         extract_body: Dict[str, Any] = {
             "model": original_body.get("model", ""),
             "instructions": tool_system,
-            "input": source_input if isinstance(source_input, list) else [],
+            "input": extract_input,
             "text": {"format": {"type": "json_object"}},
             "stream": True,
         }
@@ -1215,7 +1214,7 @@ class OpenAIResponsesFCEnhance:
                         lines[1:-1] if lines[-1].strip() == "```" else lines[1:]
                     )
                 parsed = json.loads(text)
-                return parsed if isinstance(parsed, dict) else None
+                return parsed if isinstance(parsed, dict) and parsed else None
         except Exception:
             return None
 
