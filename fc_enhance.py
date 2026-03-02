@@ -69,7 +69,7 @@ _EXTRACT_PROMPT_TEMPLATE = (
     "{tool_history_section}"
     "请仔细分析以下完整对话上下文（包括用户消息、助手回复和工具调用结果），"
     "从中提取调用该工具所需的参数。\n"
-    "只输出 JSON 参数对象，不要包含任何其他文字。"
+    "只输出 JSON 参数对象，不要包含任何其他文字。不可以空回复。"
 )
 
 
@@ -354,7 +354,7 @@ class OpenAIFCEnhance:
         tool_history_section = ""
         if history_entries:
             tool_history_section = (
-                "以下是该工具之前的调用历史（参数和结果），请避免重复使用已失败的参数：\n"
+                "以下是该工具之前的调用历史（参数和结果），请严格避免重复使用过去的参数，探索更多可能性：\n"
                 + "\n".join(history_entries) + "\n"
             )
 
@@ -682,7 +682,7 @@ class ClaudeFCEnhance:
         tool_history_section = ""
         if history_entries:
             tool_history_section = (
-                "以下是该工具之前的调用历史（参数和结果），请避免重复使用已失败的参数：\n"
+                "以下是该工具之前的调用历史（参数和结果），请严格避免重复使用过去的参数，探索更多可能性：\n"
                 + "\n".join(history_entries) + "\n"
             )
 
@@ -1019,7 +1019,7 @@ class GeminiFCEnhance:
         tool_history_section = ""
         if history_entries:
             tool_history_section = (
-                "以下是该工具之前的调用历史（参数和结果），请避免重复使用已失败的参数：\n"
+                "以下是该工具之前的调用历史（参数和结果），请严格避免重复使用过去的参数，探索更多可能性：\n"
                 + "\n".join(history_entries) + "\n"
             )
 
@@ -1335,7 +1335,7 @@ class OpenAIResponsesFCEnhance:
             tool_history_section = ""
             if history_entries:
                 tool_history_section = (
-                    "以下是该工具之前的调用历史（参数和结果），请避免重复使用已失败的参数：\n"
+                    "以下是该工具之前的调用历史（参数和结果），请严格避免重复使用过去的参数，探索更多可能性：\n"
                     + "\n".join(history_entries) + "\n"
                 )
 
