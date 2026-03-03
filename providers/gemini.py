@@ -155,7 +155,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                                     forwarded_text += p["text"]
                     fc_buffer.append(payload)
                 elif fc_detected:
-                    # FC 检测后的纯文本 payload，转发并累加
+                    # FC 检测后的 payload，转发并放入 buffer
                     for candidate in (payload.get("candidates") or []):
                         for part in ((candidate.get("content") or {}).get("parts") or []):
                             if isinstance(part.get("text"), str):
@@ -163,7 +163,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     await client.write(f"data: {json.dumps(payload)}\n\n".encode())
                     fc_buffer.append(payload)
                 else:
-                    # 累加已转发 payload 中的文本
+                    # FC 之前的 payload，转发并累加
                     text_found = False
                     for candidate in (payload.get("candidates") or []):
                         for part in ((candidate.get("content") or {}).get("parts") or []):
@@ -173,6 +173,9 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     if text_found:
                         logger.info("Streamify [文本累加]: forwarded_text 总长度=%d", len(forwarded_text))
                     await client.write(f"data: {json.dumps(payload)}\n\n".encode())
+                    # 将文本 payload 也放入 fc_buffer，用于后续组装
+                    if text_found:
+                        fc_buffer.append(payload)
 
         if not fc_detected:
             await client.write_eof()
