@@ -206,8 +206,11 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                 context=clean_body.get("contents", []))
             if self.debug:
                 logger.info("Streamify [Layer1]: 成功提取 Gemini 工具 %s 参数(流式)", fn_name)
+            logger.info("Streamify [debug]: 准备写入 response_data，工具 %s", fn_name)
             await client.write(f"data: {json.dumps(response_data)}\n\n".encode())
+            logger.info("Streamify [debug]: 已写入 response_data，准备 write_eof")
             await client.write_eof()
+            logger.info("Streamify [debug]: 已完成 write_eof，返回 client")
             return client
         elif self.debug:
             logger.info("Streamify [Layer1]: Gemini JSON 提取失败，重试(流式)")
