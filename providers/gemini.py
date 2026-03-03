@@ -133,7 +133,7 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
 
                 # 调试：记录每个 payload 的内容
                 has_text = any(
-                    isinstance(p.get("text"), str)
+                    "text" in p and isinstance(p.get("text"), str) and p.get("text").strip()
                     for c in (payload.get("candidates") or [])
                     for p in ((c.get("content") or {}).get("parts") or [])
                 )
