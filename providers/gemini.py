@@ -133,6 +133,15 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
 
                 if self._payload_has_fc(payload):
                     fc_detected = True
+                    # 先转发文本部分
+                    for candidate in (payload.get("candidates") or []):
+                        text_parts = [p for p in ((candidate.get("content") or {}).get("parts") or []) if "text" in p]
+                        if text_parts:
+                            text_payload = {"candidates": [{"content": {"parts": text_parts, "role": "model"}}]}
+                            await client.write(f"data: {json.dumps(text_payload)}\n\n".encode())
+                            for p in text_parts:
+                                if isinstance(p.get("text"), str):
+                                    forwarded_text += p["text"]
                     fc_buffer.append(payload)
                 else:
                     # 累加已转发 payload 中的文本
