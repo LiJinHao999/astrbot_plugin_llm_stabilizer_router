@@ -131,7 +131,17 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                 if not isinstance(payload, dict):
                     continue
 
-                if self._payload_has_fc(payload):
+                # 调试：记录每个 payload 的内容
+                has_text = any(
+                    isinstance(p.get("text"), str)
+                    for c in (payload.get("candidates") or [])
+                    for p in ((c.get("content") or {}).get("parts") or [])
+                )
+                has_fc = self._payload_has_fc(payload)
+                if has_text or has_fc:
+                    logger.info("Streamify [payload]: has_text=%s, has_fc=%s, fc_detected=%s", has_text, has_fc, fc_detected)
+
+                if has_fc:
                     fc_detected = True
                     # 先转发文本部分
                     for candidate in (payload.get("candidates") or []):
