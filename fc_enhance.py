@@ -976,42 +976,6 @@ class GeminiFCEnhance:
         )
         # 提取侧请求不做 trim：需要完整对话来收集 FC/FR 历史和原始用户文本
 
-        # 收集同名工具的历史调用参数和结果
-        func_resp_map: Dict[str, List[str]] = {}
-        for item in source_contents:
-            if not isinstance(item, dict) or item.get("role") != "user":
-                continue
-            for part in item.get("parts", []):
-                if not isinstance(part, dict):
-                    continue
-                fr = part.get("functionResponse")
-                if not isinstance(fr, dict):
-                    continue
-                resp_content = (fr.get("response") or {}).get("content", "")
-                if isinstance(resp_content, str):
-                    func_resp_map.setdefault(fr.get("name", ""), []).append(resp_content)
-
-        # 收集同名工具的历史调用：(args_dict, result_str) 对
-        history_data: List[Tuple[Dict[str, Any], str]] = []
-        resp_idx: Dict[str, int] = {}
-        for item in source_contents:
-            if not isinstance(item, dict) or item.get("role") != "model":
-                continue
-            for part in item.get("parts", []):
-                if not isinstance(part, dict):
-                    continue
-                fc = part.get("functionCall")
-                if not isinstance(fc, dict) or fc.get("name") != function_name:
-                    continue
-                args = fc.get("args") or {}
-                idx = resp_idx.get(function_name, 0)
-                resp_list = func_resp_map.get(function_name, [])
-                res_str = resp_list[idx] if idx < len(resp_list) else ""
-                resp_idx[function_name] = idx + 1
-                if len(res_str) > 500:
-                    res_str = res_str[:500] + "…(截断)"
-                history_data.append((args, res_str))
-
         tool_system = _EXTRACT_PROMPT_TEMPLATE.format(
             function_name=function_name,
             func_desc=func_desc,
@@ -1048,22 +1012,20 @@ class GeminiFCEnhance:
                 "parts": [{"text": "\n".join(context_lines)}],
             })
 
-        # 历史调用作为多轮：model 输出之前的 JSON → user 反馈失败
-        for args, res in history_data:
+        # 从实例状态注入之前提取过的参数（不依赖 source_contents 中的 FC/FR）
+        prev_attempts: List[Dict[str, Any]] = getattr(self, '_extract_attempts', {}).get(function_name, [])
+        for prev_args in prev_attempts:
             extract_contents.append({
                 "role": "model",
-                "parts": [{"text": json.dumps(args, ensure_ascii=False)}],
+                "parts": [{"text": json.dumps(prev_args, ensure_ascii=False)}],
             })
-            feedback = "这组参数已经尝试过了，后续请不要再尝试它。"
-            if res:
-                feedback += f" 返回: {res}"
-            feedback += (
-                " 请换个思路重新推断参数，"
-                "如减少关键词数量，更换描述，将中文关键词换为英文等。"
-            )
             extract_contents.append({
                 "role": "user",
-                "parts": [{"text": feedback}],
+                "parts": [{"text": (
+                    "这组参数已经尝试过了，后续请不要再尝试它。"
+                    " 请换个思路重新推断参数，"
+                    "如减少关键词数量，更换描述，将中文关键词换为英文等。"
+                )}],
             })
 
         if not extract_contents:
@@ -1173,6 +1135,10 @@ class GeminiFCEnhance:
                         "Streamify [extract]: 工具 %s 提取成功: %s",
                         function_name, json.dumps(parsed, ensure_ascii=False),
                     )
+                    # 记录本次提取结果，供后续调用构建多轮历史
+                    if not hasattr(self, '_extract_attempts'):
+                        self._extract_attempts: Dict[str, List[Dict[str, Any]]] = {}  # type: ignore[attr-defined]
+                    self._extract_attempts.setdefault(function_name, []).append(parsed)  # type: ignore[attr-defined]
                     return parsed
                 logger.warning("Streamify [extract]: 工具 %s 解析结果为空", function_name)
                 return None
