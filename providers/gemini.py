@@ -178,7 +178,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             if target_fc is not None:
                 logger.info("Streamify [全部拦截]: 拦截 Gemini 工具 %s，尝试重写参数(流式)", target_fc.get("name", ""))
 
-        logger.info("Streamify [debug]: 检查 target_fc，is None=%s", target_fc is None)
         if target_fc is None:
             # 无需修复：重放原始 FC 事件
             for payload in fc_buffer:
@@ -187,7 +186,6 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
             return client
 
         # 需要修复
-        logger.info("Streamify [debug]: 开始提取模型回复文本")
         # 提取模型回复文本（已转发文本 + FC 响应中的文本 parts）
         _reply_parts = []
         for candidate in response_data.get("candidates", []):
@@ -195,24 +193,19 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                 if isinstance(part.get("text"), str):
                     _reply_parts.append(part["text"])
         model_reply = forwarded_text + "".join(_reply_parts)
-        logger.info("Streamify [文本]: forwarded_text 长度=%d, _reply_parts 长度=%d, model_reply 长度=%d",
-                    len(forwarded_text), len("".join(_reply_parts)), len(model_reply))
 
         # 先发送未转发的文本（在提取参数之前）
         if model_reply and model_reply != forwarded_text:
             remaining_text = model_reply[len(forwarded_text):] if model_reply.startswith(forwarded_text) else model_reply
             if remaining_text:
-                logger.info("Streamify [文本]: 发送剩余文本，长度=%d, 内容(前50): %s", len(remaining_text), remaining_text[:50])
                 text_payload = {"candidates": [{"content": {"parts": [{"text": remaining_text}], "role": "model"}}]}
                 await client.write(f"data: {json.dumps(text_payload)}\n\n".encode())
 
         fn_name = target_fc.get("name", "")
-        logger.info("Streamify [debug]: 准备调用 _extract_args_as_json，工具 %s", fn_name)
         extracted = await self._extract_args_as_json(
             clean_body, fn_name, stream_path, headers, params,
             model_reply=model_reply,
         )
-        logger.info("Streamify [debug]: _extract_args_as_json 返回，extracted 类型=%s, 值=%s", type(extracted).__name__, extracted)
         if extracted is not None:
             _before = target_fc.get("args", {})
             self._patch_function_call_args(response_data, fn_name, extracted)

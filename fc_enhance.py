@@ -1177,13 +1177,12 @@ class GeminiFCEnhance:
                     parsed = json.loads(text)
                 except json.JSONDecodeError:
                     parsed = None
+                    # 只尝试前1000个字符中的 JSON
+                    search_text = text[:1000] if len(text) > 1000 else text
                     decoder = json.JSONDecoder()
                     pos = 0
-                    attempts = 0
-                    max_attempts = 100  # 最多尝试100次
-                    while pos < len(text) and attempts < max_attempts:
-                        attempts += 1
-                        idx = text.find("{", pos)
+                    while pos < len(search_text):
+                        idx = search_text.find("{", pos)
                         if idx == -1:
                             break
                         try:
@@ -1194,9 +1193,6 @@ class GeminiFCEnhance:
                         except json.JSONDecodeError:
                             pos = idx + 1
                             continue
-                    if attempts >= max_attempts:
-                        logger.warning("Streamify [extract]: 工具 %s JSON 解析尝试次数超限，返回空参数", function_name)
-                        return {}
                     if parsed is None:
                         logger.warning("Streamify [extract]: 工具 %s 响应中无 JSON 对象，返回空参数", function_name)
                         return {}
