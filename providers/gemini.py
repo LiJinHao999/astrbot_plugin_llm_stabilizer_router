@@ -186,6 +186,13 @@ class GeminiHandler(ProviderHandler, GeminiFakeNonStream, GeminiFCEnhance):
                     _reply_parts.append(part["text"])
         model_reply = forwarded_text + "".join(_reply_parts)
 
+        # 先发送未转发的文本（在提取参数之前）
+        if model_reply and model_reply != forwarded_text:
+            remaining_text = model_reply[len(forwarded_text):] if model_reply.startswith(forwarded_text) else model_reply
+            if remaining_text:
+                text_payload = {"candidates": [{"content": {"parts": [{"text": remaining_text}], "role": "model"}}]}
+                await client.write(f"data: {json.dumps(text_payload)}\n\n".encode())
+
         fn_name = target_fc.get("name", "")
         extracted = await self._extract_args_as_json(
             clean_body, fn_name, stream_path, headers, params,

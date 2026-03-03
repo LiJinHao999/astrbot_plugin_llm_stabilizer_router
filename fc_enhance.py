@@ -1026,6 +1026,7 @@ class GeminiFCEnhance:
 
         # 提取对话中的纯文本，去除 functionCall / functionResponse
         context_lines: List[str] = []
+        last_fr_for_tool: Optional[str] = None  # 最新的该工具的 functionResponse
         for item in source_contents:
             if not isinstance(item, dict):
                 continue
@@ -1033,6 +1034,11 @@ class GeminiFCEnhance:
             for part in item.get("parts", []):
                 if not isinstance(part, dict):
                     continue
+                # 记录最新的该工具的 functionResponse
+                fr = part.get("functionResponse")
+                if isinstance(fr, dict) and fr.get("name") == function_name:
+                    resp = fr.get("response", {})
+                    last_fr_for_tool = json.dumps(resp, ensure_ascii=False)
                 if "functionCall" in part or "functionResponse" in part:
                     continue
                 text = part.get("text", "")
@@ -1047,9 +1053,13 @@ class GeminiFCEnhance:
         # 构建多轮提取对话
         extract_contents: List[Dict[str, Any]] = []
         if context_lines:
+            user_text = "\n".join(context_lines)
+            # 如果有最新的工具返回结果，注入到 user 消息中
+            if last_fr_for_tool:
+                user_text += f"\n\n工具 `{function_name}` 最新返回结果：{last_fr_for_tool}"
             extract_contents.append({
                 "role": "user",
-                "parts": [{"text": "\n".join(context_lines)}],
+                "parts": [{"text": user_text}],
             })
 
         # 用用户消息文本做 key，新消息来了自动清空历史
