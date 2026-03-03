@@ -1187,21 +1187,22 @@ class GeminiFCEnhance:
                     if parsed is None:
                         logger.warning("Streamify [extract]: 工具 %s 响应中无 JSON 对象，返回空参数", function_name)
                         return {}
-                if isinstance(parsed, dict) and parsed:
-                    logger.info(
-                        "Streamify [extract]: 工具 %s 提取成功: %s",
-                        function_name, json.dumps(parsed, ensure_ascii=False),
-                    )
-                    # 记录本次提取结果，供后续调用构建多轮历史
-                    if not hasattr(self, '_extract_attempts'):
-                        self._extract_attempts: Dict[str, List[Dict[str, Any]]] = {}  # type: ignore[attr-defined]
-                    self._extract_attempts.setdefault(function_name, []).append(parsed)  # type: ignore[attr-defined]
+                if isinstance(parsed, dict):
+                    if parsed:
+                        logger.info(
+                            "Streamify [extract]: 工具 %s 提取成功: %s",
+                            function_name, json.dumps(parsed, ensure_ascii=False),
+                        )
+                        # 记录本次提取结果，供后续调用构建多轮历史
+                        if not hasattr(self, '_extract_attempts'):
+                            self._extract_attempts: Dict[str, List[Dict[str, Any]]] = {}  # type: ignore[attr-defined]
+                        self._extract_attempts.setdefault(function_name, []).append(parsed)  # type: ignore[attr-defined]
+                    else:
+                        logger.warning("Streamify [extract]: 工具 %s 解析结果为空对象", function_name)
                     return parsed
-                logger.warning("Streamify [extract]: 工具 %s 解析结果为空", function_name)
-                return None
         except Exception as exc:
             logger.warning("Streamify [extract]: 工具 %s 异常: %s", function_name, exc)
-            return None
+            return {}
 
     @staticmethod
     def _inject_hint(body: Dict[str, Any], tool_name: str = "") -> Dict[str, Any]:
